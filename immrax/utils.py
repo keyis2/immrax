@@ -185,23 +185,46 @@ def get_half_intervals(x: Interval, N=1, ut=False):
 # ================================================================================
 
 # @partial(jax.jit,static_argnums=(1,))
-def get_partitions_ut(x: jax.Array, N: int) -> jax.Array:
-    n = len(x) // 2
-    # c^n = N
-    c = floor(exp(log(N) / n) + 1e-10)
-    _x = x[:n]
-    x_ = x[n:]
-    xc = []
-    for i in range(c + 1):
-        xc.append(_x + i * (x_ - _x) / c)
-    l = onp.arange(c)
-    A = onp.array(onp.meshgrid(*[l for i in range(n)])).reshape((n, -1)).T
-    ret = []
-    for i in range(len(A)):
-        _part = jnp.array([xc[A[i, j]][j] for j in range(n)])
-        part_ = jnp.array([xc[A[i, j] + 1][j] for j in range(n)])
-        ret.append(jnp.concatenate((_part, part_)))
-    return jnp.array(ret)
+# def get_partitions_ut(x: jax.Array, N: int) -> jax.Array:
+#     n = len(x) // 2
+#     # c^n = N
+#     c = floor(exp(log(N) / n) + 1e-10)
+#     _x = x[:n]
+#     x_ = x[n:]
+#     xc = []
+#     for i in range(c + 1):
+#         xc.append(_x + i * (x_ - _x) / c)
+#     l = onp.arange(c)
+#     A = onp.array(onp.meshgrid(*[l for i in range(n)])).reshape((n, -1)).T
+#     ret = []
+#     for i in range(len(A)):
+#         _part = jnp.array([xc[A[i, j]][j] for j in range(n)])
+#         part_ = jnp.array([xc[A[i, j] + 1][j] for j in range(n)])
+#         ret.append(jnp.concatenate((_part, part_)))
+#     return jnp.array(ret)
+
+@partial(jax.jit,static_argnums=(1,))
+def get_partitions_ut(x_ut: jax.Array, N: int) -> jax.Array:
+    """
+    JAX-native splitter for a UT vector [lo, hi] of length 2n.
+    Chooses c = floor(N**(1/n)) and returns (c**n, 2n) UT boxes.
+    """
+    n = x_ut.shape[0] // 2
+    lo = jnp.asarray(x_ut[:n])
+    hi = jnp.asarray(x_ut[n:])
+    # width = hi - lo
+    # assert (width >= 0).all(), "Upper must be >= lower per dimension."
+
+    # splits per dimension (uniform)
+    c = int(onp.floor(N ** (1.0 / n)))
+
+    # edges per dim
+    edges = [jnp.linspace(lo[i], hi[i], c + 1) for i in range(n)]
+    lows  = jnp.stack(jnp.meshgrid(*[e[:-1] for e in edges], indexing="ij"), axis=-1).reshape(-1, n)
+    highs = jnp.stack(jnp.meshgrid(*[e[1:]  for e in edges], indexing="ij"), axis=-1).reshape(-1, n)
+
+    return jnp.concatenate([lows, highs], axis=1)  # shape: (c**n, 2n)
+
 
 def gen_ics(x0, N, key=jax.random.key(0)):
     # X = np.empty((N, len(x0)))

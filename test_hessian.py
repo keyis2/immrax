@@ -65,7 +65,6 @@ def remainder_bound_classic_hessian(f, x_lo, x_up):
     X = irx.interval(x_lo, x_up)
     H = irx.natif(jax.hessian(f))(X)
     H_lo, H_up = H.lower, H.upper
-    m = H_lo.shape[0]
 
     # delta^2 interval (n,)
     d2_lo, d2_up = interval_mul_lo_up(d_lo, d_up, d_lo, d_up)
@@ -137,13 +136,11 @@ def remainder_bound_classic_hessian_matrixstyle(f, x_lo, x_up):
     """
     x0 = 0.5 * (x_lo + x_up)
     d_lo, d_up = x_lo - x0, x_up - x0
-    n = x_lo.shape[0]
 
     # Vector-output Hessian inclusion: (m,n,n)
     X = irx.interval(x_lo, x_up)
     H = irx.natif(jax.hessian(f))(X)
     H_lo, H_up = H.lower, H.upper
-    m = H_lo.shape[0]
 
     # Compute y = [H] δ  (interval), y shape (m,n)
     # Treat each output i as its own (n,n) matrix: batch over i
@@ -232,7 +229,6 @@ def remainder_bound_path_based(f, x_lo, x_up):
 
     lo_b = jnp.where(free_mask, x_lo[None, :], x0[None, :])  # (n,n)
     up_b = jnp.where(free_mask, x_up[None, :], x0[None, :])  # (n,n)
-    Xb = irx.interval(lo_b, up_b)
 
     def int_hess_slice(lo, up):
         H = irx.natif(jax.hessian(f))(irx.interval(lo, up))
@@ -240,7 +236,6 @@ def remainder_bound_path_based(f, x_lo, x_up):
 
     # Batched Hessian interval: (n,m,n,n)
     Hb_lo, Hb_up = jax.vmap(int_hess_slice)(lo_b, up_b)  # (n,m,n,n)
-    m = Hb_lo.shape[1]
 
     # delta^2 for diagonal
     d2_lo, d2_up = interval_mul_lo_up(d_lo, d_up, d_lo, d_up)  # (n,)

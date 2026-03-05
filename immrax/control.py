@@ -56,12 +56,14 @@ class ControlledSystem(System):
 
     olsystem: OpenLoopSystem
     control: Control
+    out_len: int
 
-    def __init__(self, olsystem: OpenLoopSystem, control: Control) -> None:
+    def __init__(self, olsystem: OpenLoopSystem, control: Control, out_len: int) -> None:
         self.olsystem = olsystem
         self.control = control
         self.evolution = olsystem.evolution
         self.xlen = olsystem.xlen
+        self.out_len = out_len
 
     def f(self, t: Union[Integer, Float], x: jax.Array, *args) -> jax.Array:
         """Returns the value of the closed loop system

@@ -206,7 +206,7 @@ def _inclusion_pjit_p(*args, **bind_params) -> Interval:
     return natif_jaxpr(bind_jaxpr, [], *args)
 
 
-inclusion_registry[jax._src.pjit.pjit_p] = _inclusion_pjit_p
+inclusion_registry[jax._src.pjit.jit_p] = _inclusion_pjit_p
 
 
 def _inclusion_scan_p(*args, **bind_params) -> Interval:

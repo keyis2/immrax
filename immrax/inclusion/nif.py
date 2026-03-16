@@ -76,6 +76,21 @@ def natif(
 
     return wrapped
 
+def _has_nan(x):
+    if isinstance(x, Interval):
+        return jnp.any(jnp.isnan(x.lower)) | jnp.any(jnp.isnan(x.upper))
+    elif isinstance(x, (jax.Array, jnp.ndarray)):
+        return jnp.any(jnp.isnan(x))
+    else:
+        return False
+
+def _has_inf(x):
+    if isinstance(x, Interval):
+        return jnp.any(jnp.isinf(x.lower)) | jnp.any(jnp.isinf(x.upper))
+    elif isinstance(x, (jax.Array, jnp.ndarray)):
+        return jnp.any(jnp.isinf(x))
+    else:
+        return False
 
 def natif_jaxpr(jaxpr: Jaxpr, consts, *args, propagate_source_info=True) -> list[Any]:
     def read(v: Atom) -> Any:
@@ -90,7 +105,7 @@ def natif_jaxpr(jaxpr: Jaxpr, consts, *args, propagate_source_info=True) -> list
     safe_map(write, jaxpr.constvars, consts)
     safe_map(write, jaxpr.invars, args)
     lu = last_used(jaxpr)
-    for eqn in jaxpr.eqns:
+    for i, eqn in enumerate(jaxpr.eqns):
         subfuns, bind_params = eqn.primitive.get_bind_params(eqn.params)
         name_stack = source_info_util.current_name_stack() + eqn.source_info.name_stack
         traceback = eqn.source_info.traceback if propagate_source_info else None
@@ -98,9 +113,26 @@ def natif_jaxpr(jaxpr: Jaxpr, consts, *args, propagate_source_info=True) -> list
             invars = safe_map(read, eqn.invars)
             if any([isinstance(read(iv), Interval) for iv in eqn.invars]):
                 try:
+                    if i == 10813 or i == 7636:
+                        print("debug")
                     ans = inclusion_registry[eqn.primitive](
                         *subfuns, *invars, **bind_params
                     )
+                    if eqn.primitive.multiple_results:
+                        bad = any(bool(_has_nan(a)) for a in ans)
+                        bad |= any(bool(_has_inf(a)) for a in ans)
+                    else:
+                        bad = bool(_has_nan(ans))
+                        bad |= bool(_has_inf(ans))
+
+                    if bad:
+                        print("\n[NAN/inf DETECTED]")
+                        print("primitive:", eqn.primitive, "id:", i)
+                        print("invars:")
+                        for k, v in enumerate(invars):
+                            print(f"  arg{k}:", v)
+                        print("out:", ans)
+                        # raise FloatingPointError(f"NaN/inf detected after primitive {eqn.primitive} (id: {i})")
                 except KeyError:
                     raise NotImplementedError(
                         f"{eqn.primitive} not in inclusion_registry"
@@ -165,10 +197,20 @@ _add_passthrough_to_registry(lax.max_p)
 _add_passthrough_to_registry(lax.min_p)
 _add_passthrough_to_registry(lax.exp_p)
 _add_passthrough_to_registry(lax.reduce_sum_p)
+_add_passthrough_to_registry(lax.reduce_and_p)
+_add_passthrough_to_registry(lax.reduce_or_p)
 _add_passthrough_to_registry(lax.pad_p)
 _add_passthrough_to_registry(lax.ne_p)
 _add_passthrough_to_registry(lax.lt_p)
 _add_passthrough_to_registry(lax.lt_to_p)
+_add_passthrough_to_registry(lax.le_p)
+_add_passthrough_to_registry(lax.gt_p)
+_add_passthrough_to_registry(lax.ge_p)
+
+_add_passthrough_to_registry(lax.and_p)
+_add_passthrough_to_registry(lax.or_p)
+_add_passthrough_to_registry(lax.not_p)
+
 _add_passthrough_to_registry(debug_callback_p)
 
 """
@@ -206,37 +248,83 @@ def _inclusion_pjit_p(*args, **bind_params) -> Interval:
     return natif_jaxpr(bind_jaxpr, [], *args)
 
 
+# def _inclusion_pjit_p(*args, **bind_params):
+#     bind_jaxpr = bind_params["jaxpr"]
+#     if isinstance(bind_jaxpr, jax.extend.core.ClosedJaxpr):
+#         return natif_jaxpr(bind_jaxpr.jaxpr, bind_jaxpr.consts, *args)
+#     return natif_jaxpr(bind_jaxpr, [], *args)
+
 inclusion_registry[jax._src.pjit.jit_p] = _inclusion_pjit_p
 
 
-def _inclusion_scan_p(*args, **bind_params) -> Interval:
-    # print('in scan')
-    # print(args)
+def _inclusion_scan_p(*args, **bind_params):
+    bind_jaxpr = bind_params["jaxpr"]
+    if isinstance(bind_jaxpr, jax.extend.core.ClosedJaxpr):
+        consts = list(bind_jaxpr.consts)
+        bind_jaxpr = bind_jaxpr.jaxpr
+    else:
+        consts = []
 
-    # bind_jaxpr = bind_params.pop('jaxpr')
-    # if isinstance(bind_jaxpr, jax.extend.core.ClosedJaxpr) :
-    #     bind_jaxpr = bind_jaxpr.jaxpr
+    num_consts = bind_params["num_consts"]
+    num_carry = bind_params["num_carry"]
+    length = bind_params["length"]
+    reverse = bind_params.get("reverse", False)
 
-    # isinterval = lambda x : isinstance(x, Interval)
-    # getlower = lambda x : x.lower if isinstance(x, Interval) else x
-    # getupper = lambda x : x.upper if isinstance(x, Interval) else x
-    # # carry_l = jax.tree_util.tree_map(getlower, carry, is_leaf=isinterval)
-    # # carry_u = jax.tree_util.tree_map(getupper, carry, is_leaf=isinterval)
-    # # init_l = jax.tree_util.tree_map(getlower, init, is_leaf=isinterval)
-    # # init_u = jax.tree_util.tree_map(getupper, init, is_leaf=isinterval)
-    # args_l = jax.tree.tree_map(getlower, args, is_leaf=isinterval)
-    # args_u = jax.tree.tree_map(getupper, args, is_leaf=isinterval)
+    # Flat argument structure for scan_p:
+    #   args = consts_from_args + carry + xs
+    scan_consts = list(args[:num_consts])
+    carry = list(args[num_consts:num_consts + num_carry])
+    xs = list(args[num_consts + num_carry:])
 
-    # def _natif_bind_jaxpr (scan_args_l, scan_args_u, **kwargs) :
-    #     scan_args = jax.tree.tree_map(lambda l, u : interval(l, u), scan_args_l, scan_args_u)
-    #     return natif_jaxpr(bind_jaxpr, [], *scan_args)
+    # If jaxpr came as ClosedJaxpr, prefer its embedded consts unless empty.
+    if len(consts) == 0:
+        consts = scan_consts
 
-    # def _f (carry, init) :
+    def _slice_x(x, i):
+        if isinstance(x, Interval):
+            return Interval(x.lower[i], x.upper[i])
+        else:
+            return x[i]
 
-    #     return natif_jaxpr(bind_jaxpr, [], carry, init)
+    def _stack_seq(seq):
+        # seq is a list over time of values, where each value may be Interval or array
+        first = seq[0]
+        if isinstance(first, Interval):
+            return Interval(
+                jnp.stack([v.lower for v in seq], axis=0),
+                jnp.stack([v.upper for v in seq], axis=0),
+            )
+        else:
+            return jnp.stack(seq, axis=0)
 
-    raise NotImplementedError("scan not implemented")
+    ys_over_time = None
 
+    indices = range(length - 1, -1, -1) if reverse else range(length)
+
+    for i in indices:
+        x_t = [_slice_x(x, i) for x in xs]
+        invals = [*consts, *carry, *x_t]
+
+        outvals = list(natif_jaxpr(bind_jaxpr, [], *invals))
+
+        new_carry = outvals[:num_carry]
+        y_t = outvals[num_carry:]
+
+        carry = new_carry
+
+        if ys_over_time is None:
+            ys_over_time = [[] for _ in range(len(y_t))]
+        for k, yk in enumerate(y_t):
+            ys_over_time[k].append(yk)
+
+    if ys_over_time is None:
+        ys = []
+    else:
+        if reverse:
+            ys_over_time = [list(reversed(vs)) for vs in ys_over_time]
+        ys = [_stack_seq(vs) for vs in ys_over_time]
+
+    return [*carry, *ys]
 
 inclusion_registry[lax.scan_p] = _inclusion_scan_p
 
@@ -560,13 +648,12 @@ def _inclusion_pow_p(x: Interval, y: Interval) -> Interval:
             [lax.pow(xl, yl), lax.pow(xl, yu), lax.pow(xu, yl), lax.pow(xu, yu)]
         )
         # calculate the minimum and maximum of the corners
-        cond = jnp.logical_and(x.lower >= 0, x.upper >= 0)
+        cond = jnp.logical_and(xl >= 0, xu >= 0)
         ol = jnp.where(cond, jnp.min(corners), -jnp.inf)
         ou = jnp.where(cond, jnp.max(corners), jnp.inf)
         return ol, ou
 
-    xl, yl = jnp.broadcast_arrays(x.lower, y.lower)
-    xu, yu = jnp.broadcast_arrays(x.upper, y.upper)
+    xl, xu, yl, yu = jnp.broadcast_arrays(x.lower, x.upper, y.lower, y.upper)
     xsh = jnp.shape(xl)
 
     resl, resu = jax.vmap(_inclusion_pow_impl, (0, 0, 0, 0))(
@@ -609,15 +696,37 @@ def _manual_cholesky(A):
     Computes the Cholesky decomposition of a symmetric positive definite matrix A using Python for loops.
     Returns lower-triangular matrix L such that A = L @ L.T
     """
+    A = 0.5 * (A + A.T)  # Ensure symmetry
     n = A.shape[0]
     L = jnp.zeros_like(A)
     for i in range(n):
         for j in range(i + 1):
             s = jnp.sum(L[i, :j] * L[j, :j])
-            val = jnp.where(i == j, jnp.sqrt(A[i, i] - s), (A[i, j] - s) / L[j, j])
+            # val = jnp.where(i == j, jnp.sqrt(A[i, i] - s), (A[i, j] - s) / L[j, j])
+            if i == j:
+                val = jnp.sqrt(A[i, i] - s)
+            else:
+                val = (A[i, j] - s) / L[j, j]
             L = L.at[i, j].set(val)
     return L
 
+# def _manual_cholesky(A):
+#     A = 0.5 * (A + A.T)  # Ensure symmetry
+#     n = A.shape[0]
+#     L0 = jnp.zeros_like(A)
+
+#     def body(j, L):
+#         s = L[j:, :j] @ L[j, :j]
+#         ljj = jnp.sqrt(A[j, j] - s[0])
+
+#         new_col = jnp.concatenate([
+#             jnp.array([ljj], dtype=A.dtype),
+#             (A[j+1:, j] - s[1:]) / ljj
+#         ])
+
+#         return L.at[j:, j].set(new_col)
+
+#     return lax.fori_loop(0, n, body, L0)
 
 inclusion_registry[LA.cholesky_p] = natif(_manual_cholesky)
 
@@ -634,56 +743,49 @@ def _manual_triangular_solve(
     conjugate_a=False,
     unit_diagonal=False,
 ):
-    # Apply transpose if needed
-    A = jnp.where(transpose_a, A.T, A)
-    # Apply conjugate if needed
-    A = jnp.where(conjugate_a, jnp.conj(A), A)
-    # # If unit_diagonal, set diagonal to 1
-    # if unit_diagonal:
-    #     A = A.at[jnp.diag_indices(A.shape[0])].set(1)
+    if transpose_a:
+        A = A.T
+        lower = not lower
+    if conjugate_a:
+        A = jnp.conj(A)
 
-    def lower_triangular_solve(A, b):
-        n = A.shape[0]
-        x = jnp.zeros_like(b)
-        for i in range(n):
-            s = jnp.sum(A[i, :i] * x[:i])
-            xi = (b[i] - s) / A[i, i]
-            x = x.at[i].set(xi)
-        return x
+    if not left_side:
+        return _manual_triangular_solve(
+            A.T,
+            b.T,
+            left_side=True,
+            lower=not lower,
+            transpose_a=False,
+            conjugate_a=False,
+            unit_diagonal=unit_diagonal,
+        ).T
 
-    def upper_triangular_solve(A, b):
-        n = A.shape[0]
-        x = jnp.zeros_like(b)
-        for i in range(n - 1, -1, -1):
-            s = jnp.sum(A[i, i + 1 :] * x[i + 1 :])
-            x = x.at[i].set((b[i] - s) / A[i, i])
-        return x
+    squeeze_output = (b.ndim == 1)
+    if squeeze_output:
+        b = b[:, None]
 
-    # # Choose lower or upper triangular solve
-    # x = lax.cond(lower,
-    #              lambda _: lower_triangular_solve(A, b),
-    #              lambda _: upper_triangular_solve(A, b),
-    #              operand=None)
+    n = A.shape[0]
+    x = jnp.zeros_like(b)
 
-    # # If not left_side, solve xA = b instead of Ax = b
-    # x = lax.cond(left_side,
-    #              lambda x: x,
-    #              lambda _: jnp.linalg.solve(A.T, b.T).T,
-    #              x)
+    def lower_body(i, x):
+        s = A[i, :] @ x
+        diag = 1.0 if unit_diagonal else A[i, i]
+        xi = (b[i, :] - s) / diag
+        return x.at[i, :].set(xi)
+
+    def upper_body(i_rev, x):
+        i = n - 1 - i_rev
+        s = A[i, :] @ x
+        diag = 1.0 if unit_diagonal else A[i, i]
+        xi = (b[i, :] - s) / diag
+        return x.at[i, :].set(xi)
 
     if lower:
-        if left_side:
-            x = lower_triangular_solve(A, b)
-        else:
-            x = lower_triangular_solve(A.T, b.T).T
+        x = jax.lax.fori_loop(0, n, lower_body, x)
     else:
-        if left_side:
-            x = upper_triangular_solve(A, b)
-        else:
-            x = upper_triangular_solve(A.T, b.T).T
+        x = jax.lax.fori_loop(0, n, upper_body, x)
 
-    # return lower_triangular_solve(A, b)
-    return x
+    return x[:, 0] if squeeze_output else x
 
 
 @partial(
@@ -710,7 +812,7 @@ def _inclusion_triangular_solve(
     #                      left_side=left_side, lower=lower, transpose_a=transpose_a, conjugate_a=conjugate_a, unit_diagonal=unit_diagonal))(A, b)
     return natif(
         partial(
-            jax.vmap(_manual_triangular_solve, in_axes=()),
+            _manual_triangular_solve,
             left_side=left_side,
             lower=lower,
             transpose_a=transpose_a,
@@ -723,3 +825,72 @@ def _inclusion_triangular_solve(
 inclusion_registry[LA.triangular_solve_p] = _inclusion_triangular_solve
 
 # natif(lambda A, b, left_side=True, lower=True, transpose_a=False, conjugate_a=False, unit_diagonal=False: _manual_triangular_solve(A, b, left_side=left_side, lower=lower, transpose_a=transpose_a, conjugate_a=conjugate_a, unit_diagonal=unit_diagonal))
+
+
+
+def _inclusion_abs_p(x: Interval) -> Interval:
+    l = x.lower
+    u = x.upper
+
+    # cases
+    lower = jnp.where(
+        l >= 0,
+        l,                        # entirely positive
+        jnp.where(
+            u <= 0,
+            -u,                   # entirely negative
+            0.0                   # crosses zero
+        )
+    )
+
+    upper = jnp.maximum(jnp.abs(l), jnp.abs(u))
+
+    return Interval(lower, upper)
+
+
+inclusion_registry[lax.abs_p] = _inclusion_abs_p
+Interval.__abs__ = _inclusion_abs_p
+
+
+def _inclusion_atan2_p(y: Interval, x: Interval) -> Interval:
+    y = interval(y)
+    x = interval(x)
+
+    yl, yu, xl, xu = jnp.broadcast_arrays(y.lower, y.upper, x.lower, x.upper)
+    out_shape = yl.shape
+
+    def _atan2_elem(yl, yu, xl, xu):
+        corners = jnp.array([
+            lax.atan2(yl, xl),
+            lax.atan2(yl, xu),
+            lax.atan2(yu, xl),
+            lax.atan2(yu, xu),
+        ])
+
+        # If the x-interval contains 0, atan2 can jump across quadrants / branch cut.
+        # Use a conservative enclosure.
+        x_crosses_zero = jnp.logical_and(xl <= 0, xu >= 0)
+
+        # Also be conservative if both x and y intervals contain 0.
+        y_crosses_zero = jnp.logical_and(yl <= 0, yu >= 0)
+        ambiguous = jnp.logical_and(x_crosses_zero, y_crosses_zero)
+
+        lower = jnp.where(
+            jnp.logical_or(x_crosses_zero, ambiguous),
+            -jnp.pi,
+            jnp.min(corners),
+        )
+        upper = jnp.where(
+            jnp.logical_or(x_crosses_zero, ambiguous),
+            jnp.pi,
+            jnp.max(corners),
+        )
+        return lower, upper
+
+    ol, ou = jax.vmap(_atan2_elem)(
+        yl.reshape(-1), yu.reshape(-1), xl.reshape(-1), xu.reshape(-1)
+    )
+    return Interval(ol.reshape(out_shape), ou.reshape(out_shape))
+
+
+inclusion_registry[lax.atan2_p] = _inclusion_atan2_p

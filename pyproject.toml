@@ -30,7 +30,7 @@ dependencies = [
     "jax ~= 0.8.1",
     "jaxtyping ~= 0.2.33",
     "diffrax ~= 0.7.0",
-    "equinox >= 0.12.2",
+    "equinox ~= 0.13.2",
     "immutabledict ~= 4.2.0",
 	# jax_verify dependencies.
 	"absl-py",

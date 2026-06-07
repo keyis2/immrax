@@ -598,8 +598,8 @@ def fastlin(
 
 
 class NNCSystem(ControlledSystem):
-    def __init__(self, olsystem: OpenLoopSystem, control: NeuralNetwork) -> None:
-        super().__init__(olsystem, control)
+    def __init__(self, olsystem: OpenLoopSystem, control: NeuralNetwork, out_len: int) -> None:
+        super().__init__(olsystem, control, out_len)
 
 
 class NNCEmbeddingSystem(EmbeddingSystem):
@@ -631,9 +631,9 @@ class NNCEmbeddingSystem(EmbeddingSystem):
 
         # NN Verifier Transform
         if nn_verifier == "crown":
-            self.verifier = crown(sys.control)
+            self.verifier = crown(sys.control, self.sys.out_len)
         elif nn_verifier == "fastlin":
-            self.verifier = fastlin(sys.control)
+            self.verifier = fastlin(sys.control, self.sys.out_len)
         else:
             raise NotImplementedError(
                 f'nn_verifier must be one of "crown" or "fastlin", {self.nn_verifier} not supported'
@@ -658,7 +658,7 @@ class NNCEmbeddingSystem(EmbeddingSystem):
         ix = refine(ut2i(x))
 
         n = self.sys.xlen
-        p = self.sys.control.out_len
+        p = self.sys.out_len
         q = len(w)
 
         # def F (t, x, w) :

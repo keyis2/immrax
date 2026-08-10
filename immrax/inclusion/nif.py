@@ -113,26 +113,24 @@ def natif_jaxpr(jaxpr: Jaxpr, consts, *args, propagate_source_info=True) -> list
             invars = safe_map(read, eqn.invars)
             if any([isinstance(read(iv), Interval) for iv in eqn.invars]):
                 try:
-                    if i == 10813 or i == 7636:
-                        print("debug")
                     ans = inclusion_registry[eqn.primitive](
                         *subfuns, *invars, **bind_params
                     )
-                    if eqn.primitive.multiple_results:
-                        bad = any(bool(_has_nan(a)) for a in ans)
-                        bad |= any(bool(_has_inf(a)) for a in ans)
-                    else:
-                        bad = bool(_has_nan(ans))
-                        bad |= bool(_has_inf(ans))
+                    # if eqn.primitive.multiple_results:
+                    #     bad = any(bool(_has_nan(a)) for a in ans)
+                    #     bad |= any(bool(_has_inf(a)) for a in ans)
+                    # else:
+                    #     bad = bool(_has_nan(ans))
+                    #     bad |= bool(_has_inf(ans))
 
-                    if bad:
-                        print("\n[NAN/inf DETECTED]")
-                        print("primitive:", eqn.primitive, "id:", i)
-                        print("invars:")
-                        for k, v in enumerate(invars):
-                            print(f"  arg{k}:", v)
-                        print("out:", ans)
-                        # raise FloatingPointError(f"NaN/inf detected after primitive {eqn.primitive} (id: {i})")
+                    # if bad:
+                    #     print("\n[NAN/inf DETECTED]")
+                    #     print("primitive:", eqn.primitive, "id:", i)
+                    #     print("invars:")
+                    #     for k, v in enumerate(invars):
+                    #         print(f"  arg{k}:", v)
+                    #     print("out:", ans)
+                    #     # raise FloatingPointError(f"NaN/inf detected after primitive {eqn.primitive} (id: {i})")
                 except KeyError:
                     raise NotImplementedError(
                         f"{eqn.primitive} not in inclusion_registry"
@@ -691,42 +689,42 @@ Interval.__matmul__ = jit(natif(jnp.matmul))
 
 
 # Cholesky decomposition
-def _manual_cholesky(A):
-    """
-    Computes the Cholesky decomposition of a symmetric positive definite matrix A using Python for loops.
-    Returns lower-triangular matrix L such that A = L @ L.T
-    """
-    A = 0.5 * (A + A.T)  # Ensure symmetry
-    n = A.shape[0]
-    L = jnp.zeros_like(A)
-    for i in range(n):
-        for j in range(i + 1):
-            s = jnp.sum(L[i, :j] * L[j, :j])
-            # val = jnp.where(i == j, jnp.sqrt(A[i, i] - s), (A[i, j] - s) / L[j, j])
-            if i == j:
-                val = jnp.sqrt(A[i, i] - s)
-            else:
-                val = (A[i, j] - s) / L[j, j]
-            L = L.at[i, j].set(val)
-    return L
-
 # def _manual_cholesky(A):
+#     """
+#     Computes the Cholesky decomposition of a symmetric positive definite matrix A using Python for loops.
+#     Returns lower-triangular matrix L such that A = L @ L.T
+#     """
 #     A = 0.5 * (A + A.T)  # Ensure symmetry
 #     n = A.shape[0]
-#     L0 = jnp.zeros_like(A)
+#     L = jnp.zeros_like(A)
+#     for i in range(n):
+#         for j in range(i + 1):
+#             s = jnp.sum(L[i, :j] * L[j, :j])
+#             # val = jnp.where(i == j, jnp.sqrt(A[i, i] - s), (A[i, j] - s) / L[j, j])
+#             if i == j:
+#                 val = jnp.sqrt(A[i, i] - s)
+#             else:
+#                 val = (A[i, j] - s) / L[j, j]
+#             L = L.at[i, j].set(val)
+#     return L
 
-#     def body(j, L):
-#         s = L[j:, :j] @ L[j, :j]
-#         ljj = jnp.sqrt(A[j, j] - s[0])
+def _manual_cholesky(A):
+    A = 0.5 * (A + A.T)  # Ensure symmetry
+    n = A.shape[0]
+    L0 = jnp.zeros_like(A)
 
-#         new_col = jnp.concatenate([
-#             jnp.array([ljj], dtype=A.dtype),
-#             (A[j+1:, j] - s[1:]) / ljj
-#         ])
+    def body(j, L):
+        s = L[j:, :j] @ L[j, :j]
+        ljj = jnp.sqrt(A[j, j] - s[0])
 
-#         return L.at[j:, j].set(new_col)
+        new_col = jnp.concatenate([
+            jnp.array([ljj], dtype=A.dtype),
+            (A[j+1:, j] - s[1:]) / ljj
+        ])
 
-#     return lax.fori_loop(0, n, body, L0)
+        return L.at[j:, j].set(new_col)
+
+    return lax.fori_loop(0, n, body, L0)
 
 inclusion_registry[LA.cholesky_p] = natif(_manual_cholesky)
 

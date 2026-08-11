@@ -499,6 +499,15 @@ def _inclusion_dot_general_p(A: Interval, B: Interval, **kwargs) -> Interval:
 
         isum = lambda x: Interval(jnp.sum(x.lower), jnp.sum(x.upper))
 
+        if len(lhs_contracting) == 0:
+            a = A
+            b = B
+            for _ in range(B.lower.ndim):
+                a = Interval(jnp.expand_dims(a.lower, -1), jnp.expand_dims(a.upper, -1))
+            for _ in range(A.lower.ndim):
+                b = Interval(jnp.expand_dims(b.lower, 0), jnp.expand_dims(b.upper, 0))
+            return _mul(a, b)
+
         # Two vectors -> scalar
         def f(a, b):
             # _mulres = jax.vmap(_mul)(a, b)
@@ -689,44 +698,52 @@ Interval.__matmul__ = jit(natif(jnp.matmul))
 
 
 # Cholesky decomposition
-# def _manual_cholesky(A):
-#     """
-#     Computes the Cholesky decomposition of a symmetric positive definite matrix A using Python for loops.
-#     Returns lower-triangular matrix L such that A = L @ L.T
-#     """
-#     A = 0.5 * (A + A.T)  # Ensure symmetry
-#     n = A.shape[0]
-#     L = jnp.zeros_like(A)
-#     for i in range(n):
-#         for j in range(i + 1):
-#             s = jnp.sum(L[i, :j] * L[j, :j])
-#             # val = jnp.where(i == j, jnp.sqrt(A[i, i] - s), (A[i, j] - s) / L[j, j])
-#             if i == j:
-#                 val = jnp.sqrt(A[i, i] - s)
-#             else:
-#                 val = (A[i, j] - s) / L[j, j]
-#             L = L.at[i, j].set(val)
-#     return L
-
 def _manual_cholesky(A):
+    """
+    Computes the Cholesky decomposition of a symmetric positive definite matrix A using Python for loops.
+    Returns lower-triangular matrix L such that A = L @ L.T
+    """
     A = 0.5 * (A + A.T)  # Ensure symmetry
     n = A.shape[0]
+    L = jnp.zeros_like(A)
+    for i in range(n):
+        for j in range(i + 1):
+            s = jnp.sum(L[i, :j] * L[j, :j])
+            val = jnp.where(i == j, jnp.sqrt(A[i, i] - s), (A[i, j] - s) / L[j, j])
+            # if i == j:
+            #     val = jnp.sqrt(A[i, i] - s)
+            # else:
+            #     val = (A[i, j] - s) / L[j, j]
+            L = L.at[i, j].set(val)
+    return L
+
+def _manual_cholesky_masked_scan(A):
+    A = 0.5 * (A + A.T)  # Ensure symmetry
+    n = A.shape[0]
+    idx = jnp.arange(n)
     L0 = jnp.zeros_like(A)
 
-    def body(j, L):
-        s = L[j:, :j] @ L[j, :j]
-        ljj = jnp.sqrt(A[j, j] - s[0])
+    def body(L, j):
+        active_prev = idx < j
+        active_col = idx == j
+        active_rows = idx >= j
 
-        new_col = jnp.concatenate([
-            jnp.array([ljj], dtype=A.dtype),
-            (A[j+1:, j] - s[1:]) / ljj
-        ])
+        a_col = jnp.sum(A * active_col[None, :], axis=1)
+        row_j = jnp.sum(L * active_col[:, None], axis=0) * active_prev
+        s = L @ row_j
+        ajj = jnp.sum(a_col * active_col)
+        sjj = jnp.sum(s * active_col)
+        ljj = jnp.sqrt(ajj - sjj)
 
-        return L.at[j:, j].set(new_col)
+        raw_col = (a_col - s) / ljj
+        new_col = jnp.where(active_col, ljj, raw_col)
+        update_col = active_rows[:, None] & active_col[None, :]
+        return jnp.where(update_col, new_col[:, None], L), None
 
-    return lax.fori_loop(0, n, body, L0)
+    return lax.scan(body, L0, idx)[0]
 
-inclusion_registry[LA.cholesky_p] = natif(_manual_cholesky)
+
+inclusion_registry[LA.cholesky_p] = natif(_manual_cholesky_masked_scan)
 
 # Triangular solve
 

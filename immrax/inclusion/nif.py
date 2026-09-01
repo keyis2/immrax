@@ -130,7 +130,7 @@ def natif_jaxpr(jaxpr: Jaxpr, consts, *args, propagate_source_info=True) -> list
                     #     for k, v in enumerate(invars):
                     #         print(f"  arg{k}:", v)
                     #     print("out:", ans)
-                    #     # raise FloatingPointError(f"NaN/inf detected after primitive {eqn.primitive} (id: {i})")
+                    #     raise FloatingPointError(f"NaN/inf detected after primitive {eqn.primitive} (id: {i})")
                 except KeyError:
                     raise NotImplementedError(
                         f"{eqn.primitive} not in inclusion_registry"
@@ -167,6 +167,14 @@ def _add_passthrough_to_registry(primitive: Primitive) -> None:
     inclusion_registry[primitive] = _make_inclusion_passthrough_p(primitive)
 
 
+def _copy_predicate_metadata(dst: Interval, src: Interval) -> Interval:
+    if hasattr(src, "_true_domain"):
+        dst._true_domain = src._true_domain
+    if hasattr(src, "_source_bounds"):
+        dst._source_bounds = src._source_bounds
+    return dst
+
+
 # We would like to passthrough array operations like reshaping, slicing, etc.
 _add_passthrough_to_registry(lax.copy_p)
 _add_passthrough_to_registry(lax.reshape_p)
@@ -187,6 +195,7 @@ if hasattr(lax, "select_p"):
 if hasattr(lax, "select_n_p"):
     _add_passthrough_to_registry(lax.select_n_p)
 _add_passthrough_to_registry(lax.iota_p)
+_add_passthrough_to_registry(lax.stop_gradient_p)
 _add_passthrough_to_registry(lax.eq_p)
 _add_passthrough_to_registry(lax.convert_element_type_p)
 _add_passthrough_to_registry(lax.reduce_max_p)
@@ -327,6 +336,89 @@ def _inclusion_scan_p(*args, **bind_params):
 inclusion_registry[lax.scan_p] = _inclusion_scan_p
 
 
+def _inclusion_while_p(*args, **bind_params):
+    cond_jaxpr = bind_params["cond_jaxpr"]
+    body_jaxpr = bind_params["body_jaxpr"]
+    if isinstance(cond_jaxpr, jax.extend.core.ClosedJaxpr):
+        cond_consts = list(cond_jaxpr.consts)
+        cond_jaxpr = cond_jaxpr.jaxpr
+    else:
+        cond_consts = []
+    if isinstance(body_jaxpr, jax.extend.core.ClosedJaxpr):
+        body_consts = list(body_jaxpr.consts)
+        body_jaxpr = body_jaxpr.jaxpr
+    else:
+        body_consts = []
+
+    cond_nconsts = bind_params["cond_nconsts"]
+    body_nconsts = bind_params["body_nconsts"]
+    cond_consts_from_args = list(args[:cond_nconsts])
+    body_consts_from_args = list(args[cond_nconsts:cond_nconsts + body_nconsts])
+    carry = list(args[cond_nconsts + body_nconsts:])
+
+    if len(cond_consts) == 0:
+        cond_consts = cond_consts_from_args
+    if len(body_consts) == 0:
+        body_consts = body_consts_from_args
+    carry = [x if isinstance(x, Interval) else interval(x) for x in carry]
+
+    def cond_fun(carry):
+        out = natif_jaxpr(cond_jaxpr, [], *cond_consts, *carry)[0]
+        return out.lower if isinstance(out, Interval) else out
+
+    def body_fun(carry):
+        return tuple(x if isinstance(x, Interval) else interval(x)
+                     for x in natif_jaxpr(body_jaxpr, [], *body_consts, *carry))
+
+    return list(lax.while_loop(cond_fun, body_fun, tuple(carry)))
+
+
+inclusion_registry[lax.while_p] = _inclusion_while_p
+
+
+def _inclusion_cond_p(index, *args, **bind_params):
+    branches = bind_params["branches"]
+    index = index.lower if isinstance(index, Interval) else index
+
+    branch_outs = []
+    for branch in branches:
+        if isinstance(branch, jax.extend.core.ClosedJaxpr):
+            consts = list(branch.consts)
+            branch_jaxpr = branch.jaxpr
+        else:
+            consts = []
+            branch_jaxpr = branch
+        branch_outs.append(tuple(natif_jaxpr(branch_jaxpr, [], *consts, *args)))
+
+    def _select(*xs):
+        if any(isinstance(x, Interval) for x in xs):
+            xs = [interval(x) for x in xs]
+
+            def _lower(x):
+                while isinstance(x, Interval):
+                    x = x.lower
+                return x
+
+            def _upper(x):
+                while isinstance(x, Interval):
+                    x = x.upper
+                return x
+
+            return Interval(
+                lax.select_n(index, *[_lower(x) for x in xs]),
+                lax.select_n(index, *[_upper(x) for x in xs]),
+            )
+        return lax.select_n(index, *xs)
+
+    return [
+        jax.tree_util.tree_map(_select, *out_group, is_leaf=lambda x: isinstance(x, Interval))
+        for out_group in zip(*branch_outs)
+    ]
+
+
+inclusion_registry[lax.cond_p] = _inclusion_cond_p
+
+
 def _inclusion_add_p(x: Interval, y: Interval) -> Interval:
     if isinstance(x, Interval) and isinstance(y, Interval):
         return Interval(x.lower + y.lower, x.upper + y.upper)
@@ -368,6 +460,15 @@ Interval.__neg__ = _inclusion_neg_p
 
 def _inclusion_mul_p(x: Interval, y: Interval) -> Interval:
     if isinstance(x, Interval) and isinstance(y, Interval):
+        x_domain = getattr(y, "_true_domain", None)
+        if x_domain is not None and getattr(y, "_source_bounds", None) == (id(x.lower), id(x.upper)):
+            return _hull2(Interval(jnp.zeros_like(x_domain.lower), jnp.zeros_like(x_domain.upper)), x_domain)
+
+        y_domain = getattr(x, "_true_domain", None)
+        if y_domain is not None and getattr(x, "_source_bounds", None) == (id(y.lower), id(y.upper)):
+            return _hull2(Interval(jnp.zeros_like(y_domain.lower), jnp.zeros_like(y_domain.upper)), y_domain)
+
+    if isinstance(x, Interval) and isinstance(y, Interval):
         _1 = x.lower * y.lower
         _2 = x.lower * y.upper
         _3 = x.upper * y.lower
@@ -390,6 +491,156 @@ def _inclusion_mul_p(x: Interval, y: Interval) -> Interval:
 
 inclusion_registry[lax.mul_p] = _inclusion_mul_p
 Interval.__mul__ = _inclusion_mul_p
+
+
+def _comparison_bounds(x, y):
+    x = interval(x) if isinstance(x, Interval) else x
+    y = interval(y) if isinstance(y, Interval) else y
+    xl = x.lower if isinstance(x, Interval) else x
+    xu = x.upper if isinstance(x, Interval) else x
+    yl = y.lower if isinstance(y, Interval) else y
+    yu = y.upper if isinstance(y, Interval) else y
+    return xl, xu, yl, yu
+
+
+def _with_true_domain(pred: Interval, source: Interval, lower, upper) -> Interval:
+    pred._true_domain = Interval(jnp.maximum(source.lower, lower), jnp.minimum(source.upper, upper))
+    pred._source_bounds = (id(source.lower), id(source.upper))
+    return pred
+
+
+def _inclusion_lt_p(x, y) -> Interval:
+    xl, xu, yl, yu = _comparison_bounds(x, y)
+    pred = Interval(xu < yl, xl < yu)
+    if isinstance(x, Interval) and not isinstance(y, Interval):
+        pred = _with_true_domain(pred, x, -jnp.inf, y)
+    return pred
+
+
+def _inclusion_le_p(x, y) -> Interval:
+    xl, xu, yl, yu = _comparison_bounds(x, y)
+    pred = Interval(xu <= yl, xl <= yu)
+    if isinstance(x, Interval) and not isinstance(y, Interval):
+        pred = _with_true_domain(pred, x, -jnp.inf, y)
+    return pred
+
+
+def _inclusion_gt_p(x, y) -> Interval:
+    xl, xu, yl, yu = _comparison_bounds(x, y)
+    pred = Interval(xl > yu, xu > yl)
+    if isinstance(x, Interval) and not isinstance(y, Interval):
+        pred = _with_true_domain(pred, x, y, jnp.inf)
+    return pred
+
+
+def _inclusion_ge_p(x, y) -> Interval:
+    xl, xu, yl, yu = _comparison_bounds(x, y)
+    pred = Interval(xl >= yu, xu >= yl)
+    if isinstance(x, Interval) and not isinstance(y, Interval):
+        pred = _with_true_domain(pred, x, y, jnp.inf)
+    return pred
+
+
+def _inclusion_eq_p(x, y) -> Interval:
+    xl, xu, yl, yu = _comparison_bounds(x, y)
+    definitely = (xl == xu) & (yl == yu) & (xl == yl)
+    possibly = (xl <= yu) & (yl <= xu)
+    return Interval(definitely, possibly)
+
+
+def _inclusion_ne_p(x, y) -> Interval:
+    eq = _inclusion_eq_p(x, y)
+    return Interval(jnp.logical_not(eq.upper), jnp.logical_not(eq.lower))
+
+
+def _inclusion_and_p(x, y) -> Interval:
+    x = interval(x) if isinstance(x, Interval) else Interval(x, x)
+    y = interval(y) if isinstance(y, Interval) else Interval(y, y)
+    out = Interval(jnp.logical_and(x.lower, y.lower), jnp.logical_and(x.upper, y.upper))
+    x_source = getattr(x, "_source_bounds", None)
+    if x_source is not None and x_source == getattr(y, "_source_bounds", None):
+        xd = getattr(x, "_true_domain", None)
+        yd = getattr(y, "_true_domain", None)
+        if xd is not None and yd is not None:
+            out._true_domain = Interval(jnp.maximum(xd.lower, yd.lower), jnp.minimum(xd.upper, yd.upper))
+            out._source_bounds = x_source
+    return out
+
+
+def _inclusion_or_p(x, y) -> Interval:
+    x = interval(x) if isinstance(x, Interval) else Interval(x, x)
+    y = interval(y) if isinstance(y, Interval) else Interval(y, y)
+    return Interval(jnp.logical_or(x.lower, y.lower), jnp.logical_or(x.upper, y.upper))
+
+
+def _inclusion_not_p(x) -> Interval:
+    x = interval(x) if isinstance(x, Interval) else Interval(x, x)
+    return Interval(jnp.logical_not(x.upper), jnp.logical_not(x.lower))
+
+
+def _inclusion_convert_element_type_p(x, **kwargs) -> Interval:
+    out = _make_inclusion_passthrough_p(lax.convert_element_type_p)(x, **kwargs)
+    if isinstance(x, Interval):
+        out = _copy_predicate_metadata(out, x)
+    return out
+
+
+def _hull2(x, y) -> Interval:
+    x = interval(x)
+    y = interval(y)
+    return Interval(jnp.minimum(x.lower, y.lower), jnp.maximum(x.upper, y.upper))
+
+
+def _inclusion_select_p(pred, on_true, on_false) -> Interval:
+    pred = interval(pred) if isinstance(pred, Interval) else Interval(pred, pred)
+    on_true = interval(on_true)
+    on_false = interval(on_false)
+    true_only = pred.lower
+    false_only = jnp.logical_not(pred.upper)
+    hull = _hull2(on_true, on_false)
+    return Interval(
+        jnp.where(true_only, on_true.lower, jnp.where(false_only, on_false.lower, hull.lower)),
+        jnp.where(true_only, on_true.upper, jnp.where(false_only, on_false.upper, hull.upper)),
+    )
+
+
+def _inclusion_select_n_p(which, *cases) -> Interval:
+    which = interval(which) if isinstance(which, Interval) else Interval(which, which)
+    cases = [interval(c) for c in cases]
+    if len(cases) == 2 and which.lower.dtype == jnp.bool_:
+        false_case, true_case = cases
+        true_only = which.lower
+        false_only = jnp.logical_not(which.upper)
+        hull = _hull2(false_case, true_case)
+        return Interval(
+            jnp.where(true_only, true_case.lower, jnp.where(false_only, false_case.lower, hull.lower)),
+            jnp.where(true_only, true_case.upper, jnp.where(false_only, false_case.upper, hull.upper)),
+        )
+    lower = jnp.full_like(cases[0].lower, jnp.inf)
+    upper = jnp.full_like(cases[0].upper, -jnp.inf)
+    for i, case in enumerate(cases):
+        maybe_i = jnp.logical_and(which.lower <= i, i <= which.upper)
+        lower = jnp.where(maybe_i, jnp.minimum(lower, case.lower), lower)
+        upper = jnp.where(maybe_i, jnp.maximum(upper, case.upper), upper)
+    return Interval(lower, upper)
+
+
+inclusion_registry[lax.lt_p] = _inclusion_lt_p
+if hasattr(lax, "lt_to_p"):
+    inclusion_registry[lax.lt_to_p] = _inclusion_lt_p
+inclusion_registry[lax.le_p] = _inclusion_le_p
+inclusion_registry[lax.gt_p] = _inclusion_gt_p
+inclusion_registry[lax.ge_p] = _inclusion_ge_p
+inclusion_registry[lax.eq_p] = _inclusion_eq_p
+inclusion_registry[lax.convert_element_type_p] = _inclusion_convert_element_type_p
+inclusion_registry[lax.ne_p] = _inclusion_ne_p
+inclusion_registry[lax.and_p] = _inclusion_and_p
+inclusion_registry[lax.or_p] = _inclusion_or_p
+inclusion_registry[lax.not_p] = _inclusion_not_p
+if hasattr(lax, "select_p"):
+    inclusion_registry[lax.select_p] = _inclusion_select_p
+if hasattr(lax, "select_n_p"):
+    inclusion_registry[lax.select_n_p] = _inclusion_select_n_p
 
 
 def _inclusion_div_p(x: Interval, y: Interval) -> Interval:
@@ -632,6 +883,8 @@ inclusion_registry[lax.asin_p] = _inclusion_asin_p
 def _inclusion_sqrt_p(x: Interval, accuracy=None) -> Interval:
     ol = jnp.where((x.lower < 0), -jnp.inf, jnp.sqrt(x.lower))
     ou = jnp.where((x.lower < 0), -jnp.inf, jnp.sqrt(x.upper))
+    # ol = jnp.where((x.lower < 0), 0, jnp.sqrt(x.lower))
+    # ou = jnp.where((x.lower < 0), 0, jnp.sqrt(x.upper))
     return Interval(ol, ou)
 
 

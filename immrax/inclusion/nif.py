@@ -902,16 +902,75 @@ def _inclusion_pow_p(x: Interval, y: Interval) -> Interval:
     x = interval(x)
     y = interval(y)
 
-    def _inclusion_pow_impl(xl, xu, yl, yu) -> Interval:
-        # caluclate corners
-        corners = jnp.array(
-            [lax.pow(xl, yl), lax.pow(xl, yu), lax.pow(xu, yl), lax.pow(xu, yu)]
+    def _reciprocal_bounds(l, u):
+        nonzero = jnp.logical_or(l > 0, u < 0)
+        return (
+            jnp.where(nonzero, 1.0 / u, -jnp.inf),
+            jnp.where(nonzero, 1.0 / l, jnp.inf),
         )
-        # calculate the minimum and maximum of the corners
-        cond = jnp.logical_and(xl >= 0, xu >= 0)
-        ol = jnp.where(cond, jnp.min(corners), -jnp.inf)
-        ou = jnp.where(cond, jnp.max(corners), jnp.inf)
-        return ol, ou
+
+    def _square_bounds(l, u):
+        l2 = l * l
+        u2 = u * u
+        contains_zero = jnp.logical_and(l <= 0, u >= 0)
+        return jnp.where(contains_zero, 0.0, jnp.minimum(l2, u2)), jnp.maximum(l2, u2)
+
+    def _integer_pow_bounds(l, u, exponent):
+        def zero():
+            ones = jnp.ones_like(l)
+            return ones, ones
+
+        def one():
+            return l, u
+
+        def two():
+            return _square_bounds(l, u)
+
+        def three():
+            return l * l * l, u * u * u
+
+        def four():
+            l2 = l * l
+            u2 = u * u
+            l4 = l2 * l2
+            u4 = u2 * u2
+            contains_zero = jnp.logical_and(l <= 0, u >= 0)
+            return jnp.where(contains_zero, 0.0, jnp.minimum(l4, u4)), jnp.maximum(l4, u4)
+
+        def neg_one():
+            return _reciprocal_bounds(l, u)
+
+        def neg_two():
+            rl, ru = _reciprocal_bounds(l, u)
+            return _square_bounds(rl, ru)
+
+        cases = [neg_two, neg_one, zero, one, two, three, four]
+        index = jnp.asarray(exponent + 2, dtype=jnp.int32)
+        return lax.switch(index, cases)
+
+    def _inclusion_pow_impl(xl, xu, yl, yu) -> Interval:
+        point_integer = jnp.logical_and(yl == yu, yl == jnp.floor(yl))
+        supported_integer = jnp.logical_and(yl >= -2, yl <= 4)
+
+        def integer_case():
+            return _integer_pow_bounds(xl, xu, yl)
+
+        def general_case():
+            # caluclate corners
+            corners = jnp.array(
+                [lax.pow(xl, yl), lax.pow(xl, yu), lax.pow(xu, yl), lax.pow(xu, yu)]
+            )
+            # calculate the minimum and maximum of the corners
+            cond = jnp.logical_and(xl >= 0, xu >= 0)
+            ol = jnp.where(cond, jnp.min(corners), -jnp.inf)
+            ou = jnp.where(cond, jnp.max(corners), jnp.inf)
+            return ol, ou
+
+        return lax.cond(
+            jnp.logical_and(point_integer, supported_integer),
+            integer_case,
+            general_case,
+        )
 
     xl, xu, yl, yu = jnp.broadcast_arrays(x.lower, x.upper, y.lower, y.upper)
     xsh = jnp.shape(xl)

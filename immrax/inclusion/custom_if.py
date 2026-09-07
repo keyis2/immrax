@@ -4,6 +4,7 @@ import inspect
 import jax
 import jax.numpy as jnp
 from jax.interpreters import ad, batching, mlir
+from jax._src import ad_util
 
 from immrax.inclusion import nif
 
@@ -18,6 +19,7 @@ class custom_if:
     2. Associate the primitive with default batching, lowering, and jvp rules.
     3. Derive the correct shape for abstract evaluation, and associate this shape with the new primitive's abstract eval.
     4. Associate the primitive with a custom inclusion function, which can be defined using the `@f.defif` decorator.
+    5. Optionally associate the primitive with a custom JVP rule, which can be defined using the `@f.defjvp` decorator.
 
     For example, to create a primitive for `jnp.polyval` with a custom inclusion function:
 
@@ -35,6 +37,11 @@ class custom_if:
             # custom inclusion logic
             ...
 
+        @polyval.defjvp
+        def polyval_jvp(primals, tangents):
+            # custom derivative logic
+            ...
+
     Now `polyval` can be used in computations, and `nif.natif` will dispatch
     to `polyval_inclusion` when it encounters this primitive.
     """
@@ -42,6 +49,7 @@ class custom_if:
     def __init__(self, fun):
         self.fun = fun
         self._if = None
+        self._jvp = None
         self.primitive = self._create_primitive()
         functools.update_wrapper(self, fun)
 
@@ -50,12 +58,20 @@ class custom_if:
         primitive = jax.extend.core.Primitive(primitive_name)
 
         # 1. Implementation
-        primitive.def_impl(self.fun)
+        def impl(*args, **params):
+            return self.fun(*args, **params)
+
+        primitive.def_impl(impl)
 
         # 2. Abstract evaluation (shape inference)
-        def default_abstract_eval(*args_aval):
+        def default_abstract_eval(*args_aval, **params):
             try:
-                shape_dtype = jax.eval_shape(self.fun, *args_aval)
+                shape_args = [
+                    jax.ShapeDtypeStruct(arg.shape, arg.dtype) for arg in args_aval
+                ]
+                shape_dtype = jax.eval_shape(
+                    functools.partial(self.fun, **params), *shape_args
+                )
                 # TODO: I am not entirely sure if this will respect the device / ref counting behavior of the wrapped function
                 # Should look here first if those types of problems come up
                 return jax.core.ShapedArray(shape_dtype.shape, shape_dtype.dtype)
@@ -72,8 +88,11 @@ class custom_if:
         mlir.register_lowering(primitive, lowering)
 
         # 4. Batching rule
-        def batching_rule(vector_arg_values, batch_axes):
-            res = jax.vmap(self.fun, in_axes=batch_axes)(*vector_arg_values)
+        def batching_rule(vector_arg_values, batch_axes, **params):
+            res = jax.vmap(
+                functools.partial(self.fun, **params),
+                in_axes=batch_axes,
+            )(*vector_arg_values)
 
             if isinstance(res, (list, tuple)):
                 return res, tuple([0] * len(res))
@@ -100,29 +119,19 @@ class custom_if:
             # For now, we won't define JVP rules if we can't inspect the signature.
             num_args = 0
 
-        jvprules = []
-        for i in range(num_args):
+        def jvp_rule(primals, tangents, **params):
+            tangents = tuple(ad_util.instantiate(tangent) for tangent in tangents)
+            if self._jvp is not None:
+                return self._jvp(primals, tangents, **params)
+            primal_out, tangent_out = jax.jvp(
+                functools.partial(self.fun, **params),
+                primals,
+                tangents,
+            )
+            return primal_out, tangent_out
 
-            def make_jvp_rule(arg_num):
-                def jvp_rule(tangent, *primals):
-                    # Create zero tangents for all other arguments
-                    tangents = [
-                        tangent
-                        if i == arg_num
-                        else jax.tree_util.tree_map(jnp.zeros_like, primal)
-                        for i, primal in enumerate(primals)
-                    ]
-                    _primals_out, tangents_out = jax.jvp(
-                        self.fun, primals, tuple(tangents)
-                    )
-                    return tangents_out
-
-                return jvp_rule
-
-            jvprules.append(make_jvp_rule(i))
-
-        if jvprules:
-            ad.defjvp(primitive, *jvprules)
+        if num_args:
+            ad.primitive_jvps[primitive] = jvp_rule
 
         # 6. Register inclusion function
         def inclusion_dispatcher(*args, **kwargs):
@@ -138,14 +147,14 @@ class custom_if:
         return primitive
 
     def __call__(self, *args, **kwargs):
-        if kwargs:
-            raise TypeError(
-                f"Primitive '{self.primitive.name}' does not support keyword arguments. "
-                "Consider using functools.partial to bind keyword arguments."
-            )
-        return self.primitive.bind(*args)
+        return self.primitive.bind(*args, **kwargs)
 
     def defif(self, if_fun):
         """Decorator to define the inclusion function for a custom_if function."""
         self._if = if_fun
         return if_fun
+
+    def defjvp(self, jvp_fun):
+        """Decorator to define the JVP rule for a custom_if function."""
+        self._jvp = jvp_fun
+        return jvp_fun

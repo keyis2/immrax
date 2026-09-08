@@ -27,6 +27,7 @@ from jax._src.core import (
     typecheck,
 )
 from jax._src.debugging import debug_callback_p
+from jax._src.lax import linalg as LA
 from jax._src.util import safe_map
 from jax.extend.core import Primitive
 
@@ -1294,6 +1295,469 @@ def _sum_affine(x: AffineBound, axes) -> AffineBound:
     )
 
 
+# ---------------------------------------------------------------------------
+# Cholesky decomposition and triangular solve
+
+
+def _stack_affine(values, axis=0):
+    """Stack affine values without mapping over their shared input domain."""
+    like = _template(*values)
+    values = [_promote(value, like) for value in values]
+    return _new(
+        jnp.stack([value.lower_coeff for value in values], axis=axis),
+        jnp.stack([value.lower_bias for value in values], axis=axis),
+        jnp.stack([value.upper_coeff for value in values], axis=axis),
+        jnp.stack([value.upper_bias for value in values], axis=axis),
+        like,
+    )
+
+
+def _matrix_transpose(value):
+    if isinstance(value, AffineBound):
+        axes = list(range(value.ndim))
+        axes[-2], axes[-1] = axes[-1], axes[-2]
+        return value.transpose(tuple(axes))
+    return jnp.swapaxes(value, -2, -1)
+
+
+def _gershgorin_spd_lower_bound(matrix: AffineBound):
+    """Sufficient uniform SPD bound from the concretized symmetric matrix."""
+    lower, upper = matrix.lower, matrix.upper
+    magnitude = jnp.maximum(jnp.abs(lower), jnp.abs(upper))
+    diagonal_lower = jnp.diag(lower)
+    off_diagonal_sum = jnp.sum(magnitude, axis=1) - jnp.diag(magnitude)
+    return jnp.min(diagonal_lower - off_diagonal_sum)
+
+
+def _sqrt_with_spd_certificate(pivot: AffineBound, spd_lower):
+    """Square-root relaxation rescued by a certified positive pivot bound."""
+    lower, upper = pivot.lower, pivot.upper
+    certified_lower = jnp.where(lower > 0, lower, spd_lower)
+    valid = jnp.logical_or(lower > 0, spd_lower > 0)
+    safe_lower = jnp.where(valid, certified_lower, 1.0)
+    safe_upper = jnp.maximum(jnp.where(valid, upper, 1.0), safe_lower)
+    width = safe_upper - safe_lower
+    secant_slope = jnp.where(
+        width == 0,
+        1 / (2 * jnp.sqrt(safe_lower)),
+        (jnp.sqrt(safe_upper) - jnp.sqrt(safe_lower)) / jnp.where(width == 0, 1, width),
+    )
+    tangent_point = 1 / (4 * secant_slope**2)
+    result = _relax(
+        pivot,
+        secant_slope,
+        jnp.sqrt(safe_lower) - secant_slope * safe_lower,
+        secant_slope,
+        jnp.sqrt(tangent_point) - secant_slope * tangent_point,
+    )
+    exact = _constant(jnp.sqrt(safe_lower), pivot)
+    result = _select_affine(width == 0, exact, result)
+    return _select_affine(
+        valid, result, _constant_interval_bounds(-jnp.inf, jnp.inf, pivot)
+    )
+
+
+def _cholesky_recursive_2d(matrix: AffineBound):
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("Affine Cholesky requires a square matrix.")
+
+    # Match immrax's natural inclusion rule and JAX's default public API.
+    matrix = _scale(_add(matrix, _matrix_transpose(matrix)), 0.5)
+    size = matrix.shape[0]
+    spd_lower = _gershgorin_spd_lower_bound(matrix)
+    zero = _constant(jnp.asarray(0, dtype=matrix.dtype), matrix)
+    factor = [[zero for _ in range(size)] for _ in range(size)]
+
+    for column in range(size):
+        square_sum = zero
+        for k in range(column):
+            square_sum = _add(square_sum, _square(factor[column][k]))
+        pivot = _sub(matrix[column, column], square_sum)
+        diagonal = _sqrt_with_spd_certificate(pivot, spd_lower)
+        factor[column][column] = diagonal
+
+        for row in range(column + 1, size):
+            product_sum = zero
+            for k in range(column):
+                product_sum = _add(product_sum, _mul(factor[row][k], factor[column][k]))
+            numerator = _sub(matrix[row, column], product_sum)
+            factor[row][column] = _div(numerator, diagonal)
+
+    return _stack_affine([_stack_affine(row) for row in factor])
+
+
+def _cholesky_recursive(matrix, **_kwargs):
+    if not isinstance(matrix, AffineBound):
+        return LA.cholesky_p.bind(matrix)
+    if matrix.ndim == 2:
+        return _cholesky_recursive_2d(matrix)
+
+    batch_shape = matrix.shape[:-2]
+    factors = [
+        _cholesky_recursive_2d(matrix[index]) for index in np.ndindex(batch_shape)
+    ]
+    return _stack_affine(factors).reshape(batch_shape + matrix.shape[-2:])
+
+
+def _triangular_solve_recursive_left_2d(
+    matrix,
+    rhs,
+    *,
+    lower,
+    unit_diagonal,
+):
+    like = _template(matrix, rhs)
+    matrix, rhs = _promote(matrix, like), _promote(rhs, like)
+    squeeze = rhs.ndim == 1
+    if squeeze:
+        rhs = rhs.reshape((rhs.shape[0], 1))
+    if matrix.ndim != 2 or rhs.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError(
+            "Baseline affine triangular solve expects a 2-D square matrix "
+            "and a vector or 2-D right-hand side."
+        )
+    if rhs.shape[0] != matrix.shape[0]:
+        raise ValueError("Triangular matrix and right-hand side shapes do not match.")
+
+    size = matrix.shape[0]
+    zero_row = _constant(jnp.zeros(rhs.shape[1], dtype=rhs.dtype), like)
+    solution = [zero_row for _ in range(size)]
+    order = range(size) if lower else range(size - 1, -1, -1)
+
+    for row in order:
+        product_sum = zero_row
+        prior = range(row) if lower else range(row + 1, size)
+        for column in prior:
+            product_sum = _add(product_sum, _mul(matrix[row, column], solution[column]))
+        numerator = _sub(rhs[row], product_sum)
+        solution[row] = (
+            numerator if unit_diagonal else _div(numerator, matrix[row, row])
+        )
+
+    result = _stack_affine(solution)
+    return result[:, 0] if squeeze else result
+
+
+def _triangular_solve_recursive(
+    matrix,
+    rhs,
+    *,
+    left_side=True,
+    lower=True,
+    transpose_a=False,
+    conjugate_a=False,
+    unit_diagonal=False,
+):
+    del conjugate_a  # The affine domain currently has real-arithmetic semantics.
+    if not isinstance(matrix, AffineBound) and not isinstance(rhs, AffineBound):
+        return LA.triangular_solve_p.bind(
+            matrix,
+            rhs,
+            left_side=left_side,
+            lower=lower,
+            transpose_a=transpose_a,
+            conjugate_a=False,
+            unit_diagonal=unit_diagonal,
+        )
+
+    if transpose_a:
+        matrix = _matrix_transpose(matrix)
+        lower = not lower
+    if not left_side:
+        result = _triangular_solve_recursive_left_2d(
+            _matrix_transpose(matrix),
+            _matrix_transpose(rhs),
+            lower=not lower,
+            unit_diagonal=unit_diagonal,
+        )
+        return _matrix_transpose(result)
+    return _triangular_solve_recursive_left_2d(
+        matrix, rhs, lower=lower, unit_diagonal=unit_diagonal
+    )
+
+
+def _affine_matmul(left, right):
+    """Two-dimensional matrix product using affine/McCormick arithmetic."""
+    like = _template(left, right)
+    left, right = _promote(left, like), _promote(right, like)
+    if left.ndim != 2 or right.ndim != 2 or left.shape[1] != right.shape[0]:
+        raise ValueError("Affine matrix multiplication requires compatible 2-D inputs.")
+
+    zero = _constant(jnp.asarray(0, dtype=like.dtype), like)
+    rows = []
+    for i in range(left.shape[0]):
+        row = []
+        for j in range(right.shape[1]):
+            value = zero
+            for k in range(left.shape[1]):
+                value = _add(value, _mul(left[i, k], right[k, j]))
+            row.append(value)
+        rows.append(_stack_affine(row))
+    return _stack_affine(rows)
+
+
+def _set_affine_entries(value: AffineBound, mask, constant):
+    """Set selected entries to constants while retaining the shared domain."""
+    mask = jnp.broadcast_to(jnp.asarray(mask), value.shape)
+    constant = jnp.broadcast_to(jnp.asarray(constant, dtype=value.dtype), value.shape)
+    return _new(
+        jnp.where(mask[..., None], 0, value.lower_coeff),
+        jnp.where(mask, constant, value.lower_bias),
+        jnp.where(mask[..., None], 0, value.upper_coeff),
+        jnp.where(mask, constant, value.upper_bias),
+        value,
+    )
+
+
+def _effective_triangular_matrix(matrix: AffineBound, *, lower, unit_diagonal):
+    size = matrix.shape[0]
+    row, column = jnp.indices((size, size))
+    unused = column > row if lower else column < row
+    result = _set_affine_entries(matrix, unused, 0)
+    if unit_diagonal:
+        result = _set_affine_entries(result, row == column, 1)
+    return result
+
+
+def _interval_mul_bounds(x_lower, x_upper, y_lower, y_upper):
+    products = jnp.stack(
+        (
+            x_lower * y_lower,
+            x_lower * y_upper,
+            x_upper * y_lower,
+            x_upper * y_upper,
+        )
+    )
+    # IEEE gives NaN for 0 * inf, whereas its interval extension is exactly 0.
+    products = jnp.nan_to_num(products, nan=0.0, posinf=jnp.inf, neginf=-jnp.inf)
+    return jnp.min(products, axis=0), jnp.max(products, axis=0)
+
+
+def _interval_div_bounds(x_lower, x_upper, y_lower, y_upper):
+    valid = jnp.logical_or(y_lower > 0, y_upper < 0)
+    reciprocal_lower = jnp.where(valid, 1 / y_upper, -jnp.inf)
+    reciprocal_upper = jnp.where(valid, 1 / y_lower, jnp.inf)
+    return _interval_mul_bounds(
+        x_lower, x_upper, reciprocal_lower, reciprocal_upper
+    )
+
+
+def _add_constant_interval(value: AffineBound, lower, upper):
+    """Add a constant interval remainder to an affine predictor."""
+    lower, upper = jnp.broadcast_arrays(lower, upper)
+    return _new(
+        value.lower_coeff,
+        value.lower_bias + lower,
+        value.upper_coeff,
+        value.upper_bias + upper,
+        value,
+    )
+
+
+def _triangular_remainder_interval(
+    matrix: AffineBound, residual: AffineBound, *, lower, unit_diagonal
+):
+    """Enclose ``T R = -residual`` by a triangular interval recurrence."""
+    t_lower, t_upper = matrix.lower, matrix.upper
+    q_lower, q_upper = residual.lower, residual.upper
+    size, columns = residual.shape
+    zero = jnp.zeros((columns,), dtype=residual.dtype)
+    solution_lower = [zero for _ in range(size)]
+    solution_upper = [zero for _ in range(size)]
+    order = range(size) if lower else range(size - 1, -1, -1)
+
+    for row in order:
+        numerator_lower = -q_upper[row]
+        numerator_upper = -q_lower[row]
+        prior = range(row) if lower else range(row + 1, size)
+        for column in prior:
+            product_lower, product_upper = _interval_mul_bounds(
+                t_lower[row, column],
+                t_upper[row, column],
+                solution_lower[column],
+                solution_upper[column],
+            )
+            numerator_lower = numerator_lower - product_upper
+            numerator_upper = numerator_upper - product_lower
+        if unit_diagonal:
+            solution_lower[row], solution_upper[row] = (
+                numerator_lower,
+                numerator_upper,
+            )
+        else:
+            solution_lower[row], solution_upper[row] = _interval_div_bounds(
+                numerator_lower,
+                numerator_upper,
+                t_lower[row, row],
+                t_upper[row, row],
+            )
+    return jnp.stack(solution_lower), jnp.stack(solution_upper)
+
+
+def _triangular_solve_matrix_left_2d(
+    matrix,
+    rhs,
+    *,
+    lower,
+    unit_diagonal,
+):
+    """Matrix-level first-order triangular solve with a certified remainder."""
+    like = _template(matrix, rhs)
+    matrix, rhs = _promote(matrix, like), _promote(rhs, like)
+    squeeze = rhs.ndim == 1
+    if squeeze:
+        rhs = rhs.reshape((rhs.shape[0], 1))
+    if matrix.ndim != 2 or rhs.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError(
+            "Matrix-level affine triangular solve expects a 2-D square matrix "
+            "and a vector or 2-D right-hand side."
+        )
+    if rhs.shape[0] != matrix.shape[0]:
+        raise ValueError("Triangular matrix and right-hand side shapes do not match.")
+
+    matrix = _effective_triangular_matrix(
+        matrix, lower=lower, unit_diagonal=unit_diagonal
+    )
+    matrix_center = matrix.center
+    rhs_center = rhs.center
+    nominal = LA.triangular_solve_p.bind(
+        matrix_center,
+        rhs_center,
+        left_side=True,
+        lower=lower,
+        transpose_a=False,
+        conjugate_a=False,
+        unit_diagonal=unit_diagonal,
+    )
+    inverse = jnp.linalg.inv(matrix_center)
+    delta_matrix = _sub(matrix, matrix_center)
+    delta_rhs = _sub(rhs, rhs_center)
+    first_order_rhs = _sub(
+        delta_rhs, _affine_matmul(delta_matrix, nominal)
+    )
+    first_order = _affine_matmul(inverse, first_order_rhs)
+    predictor = _add(nominal, first_order)
+
+    quadratic_residual = _affine_matmul(delta_matrix, first_order)
+    remainder_lower, remainder_upper = _triangular_remainder_interval(
+        matrix,
+        quadratic_residual,
+        lower=lower,
+        unit_diagonal=unit_diagonal,
+    )
+    result = _add_constant_interval(predictor, remainder_lower, remainder_upper)
+    return result[:, 0] if squeeze else result
+
+
+def _triangular_solve_matrix(
+    matrix,
+    rhs,
+    *,
+    left_side=True,
+    lower=True,
+    transpose_a=False,
+    conjugate_a=False,
+    unit_diagonal=False,
+):
+    """Matrix-level affine inclusion for ``lax.linalg.triangular_solve``."""
+    del conjugate_a  # AffineBound currently represents real arithmetic.
+    if not isinstance(matrix, AffineBound) and not isinstance(rhs, AffineBound):
+        return LA.triangular_solve_p.bind(
+            matrix,
+            rhs,
+            left_side=left_side,
+            lower=lower,
+            transpose_a=transpose_a,
+            conjugate_a=False,
+            unit_diagonal=unit_diagonal,
+        )
+    if transpose_a:
+        matrix = _matrix_transpose(matrix)
+        lower = not lower
+    if not left_side:
+        result = _triangular_solve_matrix_left_2d(
+            _matrix_transpose(matrix),
+            _matrix_transpose(rhs),
+            lower=not lower,
+            unit_diagonal=unit_diagonal,
+        )
+        return _matrix_transpose(result)
+    return _triangular_solve_matrix_left_2d(
+        matrix, rhs, lower=lower, unit_diagonal=unit_diagonal
+    )
+
+
+def _cholesky_matrix_2d(matrix: AffineBound):
+    """Matrix-level Cholesky derivative plus a certified quadratic remainder."""
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("Affine Cholesky requires a square matrix.")
+
+    matrix = _scale(_add(matrix, _matrix_transpose(matrix)), 0.5)
+    size = matrix.shape[0]
+    center = matrix.center
+    nominal = jnp.linalg.cholesky(center)
+    inverse = jnp.linalg.inv(nominal)
+
+    perturbation = _sub(matrix, center)
+    normalized = _affine_matmul(
+        _affine_matmul(inverse, perturbation), inverse.T
+    )
+    row, column = jnp.indices((size, size))
+    phi_weight = jnp.where(row > column, 1.0, jnp.where(row == column, 0.5, 0.0))
+    first_order_normalized = _scale(normalized, phi_weight)
+    predictor = _add(nominal, _affine_matmul(nominal, first_order_normalized))
+
+    magnitude = jnp.maximum(jnp.abs(normalized.lower), jnp.abs(normalized.upper))
+    eta_squared = jnp.sum(jnp.where(row > column, magnitude**2, 0.0))
+    eta_squared += 0.25 * jnp.sum(jnp.diag(magnitude) ** 2)
+    eta = jnp.sqrt(eta_squared)
+    fixed_limit = 1 / (2 * jnp.sqrt(2.0))
+    fixed_valid = eta < fixed_limit
+    safe_eta = jnp.where(fixed_valid, eta, 0.0)
+    fixed_remainder = (
+        1 - jnp.sqrt(jnp.maximum(1 - 2 * jnp.sqrt(2.0) * safe_eta, 0.0))
+    ) ** 2 / (2 * jnp.sqrt(2.0))
+
+    # ||H||_2 <= ||H||_F, so the Frobenius endpoint bound is a sound h.
+    frobenius = jnp.sqrt(jnp.sum(magnitude**2))
+    taylor_valid = frobenius < 1
+    safe_frobenius = jnp.where(taylor_valid, frobenius, 0.0)
+    taylor_remainder = (
+        jnp.sqrt(1 + safe_frobenius)
+        * safe_frobenius**2
+        / (2 * jnp.sqrt(2.0) * (1 - safe_frobenius) ** 2)
+    )
+    certified_remainder = jnp.where(
+        jnp.logical_and(fixed_valid, taylor_valid),
+        jnp.minimum(fixed_remainder, taylor_remainder),
+        jnp.where(fixed_valid, fixed_remainder, taylor_remainder),
+    )
+    valid = jnp.logical_and(
+        jnp.logical_or(fixed_valid, taylor_valid), jnp.all(jnp.isfinite(nominal))
+    )
+
+    row_radius = jnp.sqrt(jnp.maximum(jnp.diag(center), 0)) * certified_remainder
+    radius = jnp.broadcast_to(row_radius[:, None], (size, size))
+    result = _add_constant_interval(predictor, -radius, radius)
+    top = _constant_interval_bounds(-jnp.inf, jnp.inf, result)
+    result = _select_affine(valid, result, top)
+    return _set_affine_entries(result, column > row, 0)
+
+
+def _cholesky_matrix(matrix, **_kwargs):
+    """Experimental matrix-level affine Cholesky inclusion."""
+    if not isinstance(matrix, AffineBound):
+        return LA.cholesky_p.bind(matrix)
+    if matrix.ndim == 2:
+        return _cholesky_matrix_2d(matrix)
+
+    batch_shape = matrix.shape[:-2]
+    factors = [
+        _cholesky_matrix_2d(matrix[index]) for index in np.ndindex(batch_shape)
+    ]
+    return _stack_affine(factors).reshape(batch_shape + matrix.shape[-2:])
+
+
 def _reduce_ordered(x: AffineBound, *, is_max: bool, axes):
     if not isinstance(x, AffineBound):
         primitive = lax.reduce_max_p if is_max else lax.reduce_min_p
@@ -1424,6 +1888,11 @@ affine_inclusion_registry[lax.reduce_or_p] = lambda x, *, axes: _reduce_bool(
     x, axes=axes, is_and=False
 )
 affine_inclusion_registry[lax.dot_general_p] = _dot_general
+# The recursive enclosures are tighter on the regression boxes below.  Keep
+# the matrix-level implementations available for experimentation, but do not
+# register them as the public ``affif`` defaults.
+affine_inclusion_registry[LA.cholesky_p] = _cholesky_recursive
+affine_inclusion_registry[LA.triangular_solve_p] = _triangular_solve_recursive
 # ``iota`` has no data operand and is normally evaluated directly by the
 # interpreter; registering it documents parity with nif and supports direct
 # registry use.

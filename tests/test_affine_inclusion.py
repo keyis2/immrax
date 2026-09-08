@@ -1,10 +1,14 @@
+import importlib
 import itertools
 
 import jax
 import jax.numpy as jnp
 import pytest
+from jax._src.lax import linalg as LA
 
 import immrax as irx
+
+aif_module = importlib.import_module("immrax.inclusion.aif")
 
 
 def _check_samples(function, box, enclosure, samples=41):
@@ -180,7 +184,196 @@ def test_affif_domain_failures_return_top():
     )
 
 
-def test_affif_intentionally_excludes_cholesky():
-    matrix = irx.interval(jnp.eye(2), 2 * jnp.eye(2))
-    with pytest.raises(NotImplementedError, match="cholesky"):
-        irx.affif(jnp.linalg.cholesky)(matrix)
+def test_affif_cholesky_constant_is_exact_and_uncertain_family_is_sound():
+    constant_matrix = jnp.array([[4.0, 1.0], [1.0, 3.0]])
+    constant_result = irx.affif(jnp.linalg.cholesky)(irx.interval(constant_matrix))
+    expected = jnp.linalg.cholesky(constant_matrix)
+    assert jnp.allclose(constant_result.lower, expected)
+    assert jnp.allclose(constant_result.upper, expected)
+
+    matrix = irx.interval(
+        jnp.array([[3.0, -0.2], [-0.2, 2.0]]),
+        jnp.array([[4.0, 0.2], [0.2, 3.0]]),
+    )
+    result = irx.affif(jnp.linalg.cholesky)(matrix)
+    corners = jnp.asarray(
+        list(
+            itertools.product(*zip(matrix.lower.reshape(-1), matrix.upper.reshape(-1)))
+        )
+    ).reshape((-1, 2, 2))
+    values = jax.vmap(jnp.linalg.cholesky)(corners)
+    assert jnp.all(values >= result.lower - 1e-5)
+    assert jnp.all(values <= result.upper + 1e-5)
+    assert jnp.all(result.lower <= result.upper)
+
+
+def test_affif_cholesky_domain_failure_returns_top():
+    matrix = irx.interval(
+        jnp.array([[-1.0, 0.0], [0.0, 1.0]]),
+        jnp.array([[1.0, 0.0], [0.0, 2.0]]),
+    )
+    result = irx.affif(jnp.linalg.cholesky)(matrix)
+    assert jnp.all(jnp.isneginf(jnp.diag(result.lower)))
+    assert jnp.all(jnp.isposinf(jnp.diag(result.upper)))
+
+
+def test_affif_constant_triangular_solve_is_exact_affine():
+    matrix = jnp.array([[2.0, 0.0], [-1.0, 3.0]])
+    rhs = irx.interval(
+        jnp.array([[1.0, -2.0], [-3.0, 0.5]]),
+        jnp.array([[2.0, 1.0], [4.0, 2.0]]),
+    )
+
+    def solve(value):
+        return jax.lax.linalg.triangular_solve(
+            matrix, value, left_side=True, lower=True
+        )
+
+    result = irx.affif(solve)(rhs)
+    inverse = jnp.linalg.inv(matrix)
+    positive, negative = jnp.maximum(inverse, 0), jnp.minimum(inverse, 0)
+    expected_lower = positive @ rhs.lower + negative @ rhs.upper
+    expected_upper = positive @ rhs.upper + negative @ rhs.lower
+    assert jnp.allclose(result.lower, expected_lower, atol=1e-5)
+    assert jnp.allclose(result.upper, expected_upper, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {
+            "left_side": True,
+            "lower": True,
+            "transpose_a": False,
+            "unit_diagonal": False,
+        },
+        {
+            "left_side": True,
+            "lower": False,
+            "transpose_a": False,
+            "unit_diagonal": False,
+        },
+        {
+            "left_side": True,
+            "lower": True,
+            "transpose_a": True,
+            "unit_diagonal": False,
+        },
+        {
+            "left_side": False,
+            "lower": True,
+            "transpose_a": False,
+            "unit_diagonal": False,
+        },
+        {
+            "left_side": True,
+            "lower": True,
+            "transpose_a": False,
+            "unit_diagonal": True,
+        },
+    ],
+)
+def test_affif_uncertain_triangular_solve_flags_are_sound(options):
+    parameters = irx.interval(
+        jnp.array([2.0, 1.5, -0.2, 1.0, -2.0]),
+        jnp.array([3.0, 2.5, 0.4, 2.0, 1.0]),
+    )
+
+    def solve(p):
+        if options["lower"]:
+            matrix = jnp.array([[p[0], 0.0], [p[2], p[1]]])
+        else:
+            matrix = jnp.array([[p[0], p[2]], [0.0, p[1]]])
+        rhs = p[3:][None, :] if not options["left_side"] else p[3:, None]
+        return jax.lax.linalg.triangular_solve(
+            matrix, rhs, conjugate_a=False, **options
+        )
+
+    result = irx.affif(solve)(parameters)
+    corners = jnp.asarray(
+        list(
+            itertools.product(
+                *zip(parameters.lower.reshape(-1), parameters.upper.reshape(-1))
+            )
+        )
+    )
+    values = jax.vmap(solve)(corners)
+    assert jnp.all(values >= result.lower - 1e-5)
+    assert jnp.all(values <= result.upper + 1e-5)
+
+
+def test_affif_singular_triangular_solve_returns_top():
+    matrix = irx.interval(
+        jnp.array([[-1.0, 0.0], [0.0, 1.0]]),
+        jnp.array([[1.0, 0.0], [0.0, 2.0]]),
+    )
+    rhs = irx.interval(jnp.ones((2, 1)))
+    result = irx.affif(
+        lambda a, b: jax.lax.linalg.triangular_solve(a, b, left_side=True, lower=True)
+    )(matrix, rhs)
+    assert jnp.any(jnp.isneginf(result.lower))
+    assert jnp.any(jnp.isposinf(result.upper))
+
+
+def test_matrix_level_cholesky_is_sound_but_recursive_baseline_is_tighter():
+    center = jnp.array([[3.0, 0.15], [0.15, 5.0]])
+    matrix = irx.interval(center - 0.1, center + 0.1)
+    affine_matrix = irx.interval_to_affine_bound(matrix)
+
+    matrix_result = aif_module._cholesky_matrix(affine_matrix).concretize()
+    baseline_result = aif_module._cholesky_recursive(affine_matrix).concretize()
+    corners = jnp.asarray(
+        list(
+            itertools.product(
+                *zip(matrix.lower.reshape(-1), matrix.upper.reshape(-1))
+            )
+        )
+    ).reshape((-1, 2, 2))
+    values = jax.vmap(jnp.linalg.cholesky)(corners)
+
+    assert jnp.all(values >= matrix_result.lower - 1e-5)
+    assert jnp.all(values <= matrix_result.upper + 1e-5)
+    assert jnp.sum(baseline_result.width) < jnp.sum(matrix_result.width)
+    assert aif_module.affine_inclusion_registry[LA.cholesky_p] is (
+        aif_module._cholesky_recursive
+    )
+
+
+def test_matrix_level_triangular_solve_is_sound_but_baseline_is_tighter():
+    matrix_center = jnp.array([[2.03, 0.0], [0.09, 3.12]])
+    matrix_radius = 0.1 * jnp.tril(jnp.ones((2, 2)))
+    matrix = irx.interval(matrix_center - matrix_radius, matrix_center + matrix_radius)
+    rhs_center = jnp.array([[-0.3, -0.2], [-0.1, 0.0]])
+    rhs = irx.interval(rhs_center - 0.1, rhs_center + 0.1)
+    domain_lower = jnp.concatenate((matrix.lower.ravel(), rhs.lower.ravel()))
+    domain_upper = jnp.concatenate((matrix.upper.ravel(), rhs.upper.ravel()))
+    affine_matrix = irx.interval_to_affine_bound(
+        matrix, domain_lower, domain_upper, offset=0
+    )
+    affine_rhs = irx.interval_to_affine_bound(
+        rhs, domain_lower, domain_upper, offset=matrix.size
+    )
+
+    options = {"left_side": True, "lower": True}
+    matrix_result = aif_module._triangular_solve_matrix(
+        affine_matrix, affine_rhs, **options
+    ).concretize()
+    baseline_result = aif_module._triangular_solve_recursive(
+        affine_matrix, affine_rhs, **options
+    ).concretize()
+    endpoints = list(
+        zip(domain_lower.reshape(-1), domain_upper.reshape(-1), strict=True)
+    )
+    corners = jnp.asarray(list(itertools.product(*endpoints)))
+    matrices = corners[:, : matrix.size].reshape((-1, 2, 2))
+    right_sides = corners[:, matrix.size :].reshape((-1, 2, 2))
+    values = jax.vmap(
+        lambda a, b: jax.lax.linalg.triangular_solve(a, b, **options)
+    )(matrices, right_sides)
+
+    assert jnp.all(values >= matrix_result.lower - 1e-5)
+    assert jnp.all(values <= matrix_result.upper + 1e-5)
+    assert jnp.sum(baseline_result.width) < jnp.sum(matrix_result.width)
+    assert aif_module.affine_inclusion_registry[LA.triangular_solve_p] is (
+        aif_module._triangular_solve_recursive
+    )

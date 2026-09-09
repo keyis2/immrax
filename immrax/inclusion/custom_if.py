@@ -1,12 +1,13 @@
 import functools
 import inspect
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jax.interpreters import ad, batching, mlir
 from jax._src import ad_util
 
-from immrax.inclusion import nif
+from . import nif
 
 
 class custom_if:
@@ -18,8 +19,13 @@ class custom_if:
     1. Create a custom primitive that is bound to the implementation of the given function.
     2. Associate the primitive with default batching, lowering, and jvp rules.
     3. Derive the correct shape for abstract evaluation, and associate this shape with the new primitive's abstract eval.
-    4. Associate the primitive with a custom inclusion function, which can be defined using the `@f.defif` decorator.
-    5. Optionally associate the primitive with a custom JVP rule, which can be defined using the `@f.defjvp` decorator.
+    4. Associate the primitive with a natural interval inclusion function,
+       defined using the `@f.defif` decorator.
+    5. Associate the primitive with affine inclusion. A specialized rule can
+       be defined using `@f.defaif`; otherwise the original implementation is
+       expanded through the affine Jaxpr interpreter.
+    6. Optionally associate the primitive with a custom JVP rule, defined
+       using the `@f.defjvp` decorator.
 
     For example, to create a primitive for `jnp.polyval` with a custom inclusion function:
 
@@ -37,18 +43,26 @@ class custom_if:
             # custom inclusion logic
             ...
 
+        @polyval.defaif
+        def polyval_affine_inclusion(a, x):
+            # specialized affine inclusion logic (optional)
+            ...
+
         @polyval.defjvp
         def polyval_jvp(primals, tangents):
             # custom derivative logic
             ...
 
-    Now `polyval` can be used in computations, and `nif.natif` will dispatch
-    to `polyval_inclusion` when it encounters this primitive.
+    Now `polyval` can be used in computations: `nif.natif` dispatches to
+    `polyval_inclusion`, while `aif.affif` dispatches to the affine rule.  If
+    `defaif` is omitted, affine evaluation expands ``fun`` directly and never
+    falls back to the ``defif`` interval rule.
     """
 
     def __init__(self, fun):
         self.fun = fun
         self._if = None
+        self._aif = None
         self._jvp = None
         self.primitive = self._create_primitive()
         functools.update_wrapper(self, fun)
@@ -144,6 +158,42 @@ class custom_if:
 
         nif.inclusion_registry[primitive] = inclusion_dispatcher
 
+        # Import here so ``aif`` can finish defining its registry before this
+        # module registers custom primitives during package initialization.
+        from . import aif
+
+        def affine_inclusion_dispatcher(*args, **params):
+            if self._aif is not None:
+                return self._aif(*args, **params)
+
+            is_abstract = lambda x: isinstance(x, (aif.AffineBound, nif.Interval))
+            trace_args = jax.tree_util.tree_map(
+                lambda x: x.lower if is_abstract(x) else x,
+                args,
+                is_leaf=is_abstract,
+            )
+            # Trace the undecorated implementation, not ``self``, to avoid
+            # recursively binding this same custom primitive.
+            closed = eqx.filter_make_jaxpr(
+                functools.partial(self.fun, **params)
+            )(*trace_args)[0]
+            # filter_make_jaxpr closes over non-array Python values. Mirror
+            # that filtering here so aif_jaxpr receives exactly one value for
+            # each dynamic Jaxpr input variable.
+            flat_args = [
+                value
+                for value in jax.tree_util.tree_leaves(
+                    args, is_leaf=is_abstract
+                )
+                if is_abstract(value) or eqx.is_array(value)
+            ]
+            outputs = aif.aif_jaxpr(
+                closed.jaxpr, closed.literals, *flat_args
+            )
+            return outputs[0] if len(outputs) == 1 else outputs
+
+        aif.affine_inclusion_registry[primitive] = affine_inclusion_dispatcher
+
         return primitive
 
     def __call__(self, *args, **kwargs):
@@ -153,6 +203,11 @@ class custom_if:
         """Decorator to define the inclusion function for a custom_if function."""
         self._if = if_fun
         return if_fun
+
+    def defaif(self, aif_fun):
+        """Decorator to define a specialized affine inclusion function."""
+        self._aif = aif_fun
+        return aif_fun
 
     def defjvp(self, jvp_fun):
         """Decorator to define the JVP rule for a custom_if function."""

@@ -1,15 +1,15 @@
 """Affine-bound inclusion evaluation for JAX programs.
 
-The public :func:`affif` transform has the same interval-facing contract as
-``natif``.  Internally it interprets a Jaxpr using :class:`AffineBound` values
-whose coefficient rows all refer to the original interval input coordinates.
+The public :func:`affif` transform can either concretize its result to an
+:class:`Interval` (the default) or retain the internal :class:`AffineBound` so
+that affine evaluations can be composed without losing source correlation.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from functools import wraps
-from typing import Any
+from typing import Any, Literal as TypingLiteral, overload
 
 import equinox as eqx
 import jax
@@ -53,7 +53,11 @@ def _constant(value, like: AffineBound) -> AffineBound:
 
 
 def _promote(value, like: AffineBound) -> AffineBound:
-    return value if isinstance(value, AffineBound) else _constant(value, like)
+    if isinstance(value, AffineBound):
+        return value
+    if isinstance(value, Interval):
+        return _constant_interval_bounds(value.lower, value.upper, like)
+    return _constant(value, like)
 
 
 def _new(lc, lb, uc, ub, like: AffineBound) -> AffineBound:
@@ -153,6 +157,24 @@ def _degenerate_exact(result: AffineBound, x: AffineBound, f) -> AffineBound:
     return _select_affine(degenerate, exact, result)
 
 
+def _jointly_degenerate_exact(
+    result: AffineBound, operands, function
+) -> AffineBound:
+    """Evaluate an operation exactly where all affine operands are points."""
+    values = []
+    degenerate = True
+    for operand in operands:
+        if isinstance(operand, AffineBound):
+            degenerate = jnp.logical_and(
+                degenerate, operand.lower == operand.upper
+            )
+            values.append(operand.lower)
+        else:
+            values.append(operand)
+    exact = _constant(function(*values), result)
+    return _select_affine(degenerate, exact, result)
+
+
 def _sanitize_affine(value):
     """Turn undefined numerical relaxation artifacts into sound top bounds."""
     if not isinstance(value, AffineBound):
@@ -166,15 +188,58 @@ def _sanitize_affine(value):
     )
 
 
+@overload
 def affif(
-    f: Callable[..., jax.Array], *, fixed_argnums: int | Sequence[int] | None = None
-) -> Callable[..., Interval]:
-    """Create an affine-bound inclusion function with an interval-only API.
+    f: Callable[..., jax.Array],
+    *,
+    fixed_argnums: int | Sequence[int] | None = None,
+    return_type: TypingLiteral["interval"] = "interval",
+) -> Callable[..., Interval]: ...
 
-    Every non-fixed positional :class:`Interval` is lifted into a shared affine
-    domain.  Results are concretized back to :class:`Interval`, so callers can
-    replace ``natif`` by ``affif`` without changing their inputs or outputs.
+
+@overload
+def affif(
+    f: Callable[..., jax.Array],
+    *,
+    fixed_argnums: int | Sequence[int] | None = None,
+    return_type: TypingLiteral["affine"],
+) -> Callable[..., AffineBound]: ...
+
+
+def affif(
+    f: Callable[..., jax.Array],
+    *,
+    fixed_argnums: int | Sequence[int] | None = None,
+    return_type: TypingLiteral["interval", "affine"] = "interval",
+) -> Callable[..., Interval | AffineBound]:
+    """Create an affine-bound inclusion function for ``f``.
+
+    Every non-fixed positional :class:`Interval` is lifted into one shared
+    affine source domain.  Existing :class:`AffineBound` arguments are instead
+    propagated in their original domain, which permits sequential affine
+    composition without relifting or concretization.  Multiple affine inputs
+    must share compatible source bounds, and mixing them with new ``Interval``
+    inputs is currently rejected.
+
+    Parameters
+    ----------
+    f:
+        JAX-traceable function to transform.
+    fixed_argnums:
+        Positional arguments that should remain point-valued.
+    return_type:
+        ``"interval"`` (the backward-compatible default) concretizes affine
+        outputs.  ``"affine"`` returns :class:`AffineBound` outputs and
+        promotes point-valued results into the active affine source domain.
+
+    Calls with no interval or affine positional inputs evaluate ``f`` normally,
+    regardless of ``return_type``.
     """
+    if return_type not in ("interval", "affine"):
+        raise ValueError(
+            "Unsupported affif return_type "
+            f"{return_type!r}; expected 'interval' or 'affine'."
+        )
     if fixed_argnums is None:
         fixed = set()
     elif isinstance(fixed_argnums, int):
@@ -182,23 +247,75 @@ def affif(
     else:
         fixed = set(fixed_argnums)
 
-    @jax.jit
-    @wraps(f)
-    def wrapped(*args, **kwargs):
-        input_intervals: list[Interval] = []
+    def abstract_inputs(args):
+        leaves = []
         for i, arg in enumerate(args):
             if i not in fixed:
-                input_intervals.extend(
-                    jax.tree_util.tree_leaves(
-                        arg, is_leaf=lambda z: isinstance(z, Interval)
-                    )
+                leaves.extend(jax.tree_util.tree_leaves(arg, is_leaf=_is_abstract))
+        return [z for z in leaves if _is_abstract(z)]
+
+    def validate_inputs(args):
+        abstract = abstract_inputs(args)
+        intervals = [z for z in abstract if isinstance(z, Interval)]
+        affines = [z for z in abstract if isinstance(z, AffineBound)]
+        if intervals and affines:
+            raise ValueError(
+                "affif cannot currently combine new Interval inputs with existing "
+                "AffineBound inputs; lift all inputs into one shared affine domain."
+            )
+        if len(affines) < 2:
+            return
+        reference = affines[0]
+        for candidate in affines[1:]:
+            if (
+                candidate.domain_lower.shape != reference.domain_lower.shape
+                or candidate.domain_upper.shape != reference.domain_upper.shape
+            ):
+                raise ValueError(
+                    "AffineBound inputs have incompatible source-domain shapes."
                 )
-        input_intervals = [z for z in input_intervals if isinstance(z, Interval)]
-        if not input_intervals:
+            # At an ordinary (non-traced) call the source boxes can be checked
+            # exactly.  Under an enclosing JAX transform only their static
+            # shapes are available, so defer the value check.
+            try:
+                compatible = np.array_equal(
+                    np.asarray(candidate.domain_lower),
+                    np.asarray(reference.domain_lower),
+                ) and np.array_equal(
+                    np.asarray(candidate.domain_upper),
+                    np.asarray(reference.domain_upper),
+                )
+            except (TypeError, jax.errors.TracerArrayConversionError):
+                compatible = True
+            if not compatible:
+                raise ValueError(
+                    "AffineBound inputs have incompatible source domains; "
+                    "unrelated affine source spaces cannot be combined."
+                )
+
+    @jax.jit
+    def compiled(*args, **kwargs):
+        abstract = abstract_inputs(args)
+        input_intervals: list[Interval] = []
+        input_affines: list[AffineBound] = []
+        for value in abstract:
+            if isinstance(value, Interval):
+                input_intervals.append(value)
+            elif isinstance(value, AffineBound):
+                input_affines.append(value)
+        if not input_intervals and not input_affines:
             return f(*args, **kwargs)
 
-        domain_lower = jnp.concatenate([z.lower.reshape(-1) for z in input_intervals])
-        domain_upper = jnp.concatenate([z.upper.reshape(-1) for z in input_intervals])
+        if input_affines:
+            domain_lower = input_affines[0].domain_lower
+            domain_upper = input_affines[0].domain_upper
+        else:
+            domain_lower = jnp.concatenate(
+                [z.lower.reshape(-1) for z in input_intervals]
+            )
+            domain_upper = jnp.concatenate(
+                [z.upper.reshape(-1) for z in input_intervals]
+            )
         offset = 0
 
         def lift(z):
@@ -220,14 +337,14 @@ def affif(
             for i, arg in enumerate(args)
         )
         trace_args = jax.tree_util.tree_map(
-            lambda z: z.lower if isinstance(z, Interval) else jnp.asarray(z),
+            lambda z: z.lower if _is_abstract(z) else jnp.asarray(z),
             args,
-            is_leaf=lambda z: isinstance(z, Interval),
+            is_leaf=_is_abstract,
         )
         trace_kwargs = jax.tree_util.tree_map(
-            lambda z: z.lower if isinstance(z, Interval) else z,
+            lambda z: z.lower if _is_abstract(z) else z,
             kwargs,
-            is_leaf=lambda z: isinstance(z, Interval),
+            is_leaf=_is_abstract,
         )
         # Close over keyword arguments.  This matches natif's documented
         # convention that only positional arguments are abstract inputs and
@@ -237,15 +354,32 @@ def affif(
         flat_affine_args = jax.tree_util.tree_leaves(affine_args, is_leaf=_is_abstract)
         outputs = aif_jaxpr(closed.jaxpr, closed.literals, *flat_affine_args)
 
-        def concretize(z):
-            if isinstance(z, AffineBound):
-                return z.concretize()
-            if isinstance(z, Interval):
-                return z
-            return interval(z)
+        if return_type == "interval":
+            def convert_output(z):
+                if isinstance(z, AffineBound):
+                    return z.concretize()
+                if isinstance(z, Interval):
+                    return z
+                return interval(z)
+        else:
+            like = input_affines[0] if input_affines else affine_args[0]
+            if not isinstance(like, AffineBound):
+                like = next(z for z in flat_affine_args if isinstance(z, AffineBound))
 
-        outputs = [concretize(z) for z in outputs]
+            def convert_output(z):
+                if isinstance(z, AffineBound):
+                    return z
+                if isinstance(z, Interval):
+                    return _constant_interval_bounds(z.lower, z.upper, like)
+                return _constant(z, like)
+
+        outputs = [convert_output(z) for z in outputs]
         return outputs[0] if len(outputs) == 1 else outputs
+
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        validate_inputs(args)
+        return compiled(*args, **kwargs)
 
     return wrapped
 
@@ -302,8 +436,48 @@ def aif_jaxpr(jaxpr: Jaxpr, consts, *args, propagate_source_info=True) -> list[A
 # Exact affine arithmetic
 
 
+def _interval_add(x, y):
+    x = x if isinstance(x, Interval) else interval(x)
+    y = y if isinstance(y, Interval) else interval(y)
+    return Interval(x.lower + y.lower, x.upper + y.upper)
+
+
+def _interval_neg(x):
+    x = x if isinstance(x, Interval) else interval(x)
+    return Interval(-x.upper, -x.lower)
+
+
+def _interval_mul(x, y):
+    x = x if isinstance(x, Interval) else interval(x)
+    y = y if isinstance(y, Interval) else interval(y)
+    products = jnp.stack(
+        (
+            x.lower * y.lower,
+            x.lower * y.upper,
+            x.upper * y.lower,
+            x.upper * y.upper,
+        )
+    )
+    return Interval(jnp.min(products, axis=0), jnp.max(products, axis=0))
+
+
+def _interval_reciprocal(x):
+    x = x if isinstance(x, Interval) else interval(x)
+    crosses_zero = jnp.logical_and(x.lower <= 0, x.upper >= 0)
+    safe_lower = jnp.where(x.lower == 0, 1, x.lower)
+    safe_upper = jnp.where(x.upper == 0, 1, x.upper)
+    lower = jnp.minimum(1 / safe_lower, 1 / safe_upper)
+    upper = jnp.maximum(1 / safe_lower, 1 / safe_upper)
+    return Interval(
+        jnp.where(crosses_zero, -jnp.inf, lower),
+        jnp.where(crosses_zero, jnp.inf, upper),
+    )
+
+
 def _add(x, y):
     if not isinstance(x, AffineBound) and not isinstance(y, AffineBound):
+        if isinstance(x, Interval) or isinstance(y, Interval):
+            return _interval_add(x, y)
         return x + y
     like = _template(x, y)
     x, y = _promote(x, like), _promote(y, like)
@@ -321,6 +495,8 @@ def _add(x, y):
 
 
 def _neg(x):
+    if isinstance(x, Interval):
+        return _interval_neg(x)
     if not isinstance(x, AffineBound):
         return lax.neg(x)
     return _new(-x.upper_coeff, -x.upper_bias, -x.lower_coeff, -x.lower_bias, x)
@@ -348,14 +524,23 @@ def _scale(x: AffineBound, c) -> AffineBound:
 
 
 def _mul(x, y):
-    if isinstance(x, AffineBound) and not isinstance(y, AffineBound):
+    if (
+        isinstance(x, AffineBound)
+        and not isinstance(y, (AffineBound, Interval))
+    ):
         return _scale(x, y)
-    if isinstance(y, AffineBound) and not isinstance(x, AffineBound):
+    if (
+        isinstance(y, AffineBound)
+        and not isinstance(x, (AffineBound, Interval))
+    ):
         return _scale(y, x)
     if not isinstance(x, AffineBound) and not isinstance(y, AffineBound):
+        if isinstance(x, Interval) or isinstance(y, Interval):
+            return _interval_mul(x, y)
         return x * y
 
-    like = x
+    like = _template(x, y)
+    x, y = _promote(x, like), _promote(y, like)
     pl, pu, ql, qu = jnp.broadcast_arrays(x.lower, x.upper, y.lower, y.upper)
     # McCormick candidates, back-substituted through existing affine forms.
     l1c, l1b = _affine_lower_plane(((ql, x), (pl, y)), -pl * ql, like)
@@ -375,6 +560,8 @@ def _mul(x, y):
 
 
 def _reciprocal(x):
+    if isinstance(x, Interval):
+        return _interval_reciprocal(x)
     if not isinstance(x, AffineBound):
         return 1 / x
     l, u = x.lower, x.upper
@@ -393,16 +580,26 @@ def _reciprocal(x):
         jnp.where(positive, ms, mt),
         jnp.where(positive, sec_c, tan_c),
     )
+    lower = _degenerate_exact(lower, x, lambda value: 1 / value)
     valid = jnp.logical_or(l > 0, u < 0)
     top = _constant_interval_bounds(-jnp.inf, jnp.inf, x)
     return _select_affine(valid, lower, top)
 
 
 def _div(x, y):
+    if isinstance(y, (AffineBound, Interval)) and isinstance(
+        x, (AffineBound, Interval)
+    ):
+        if isinstance(x, Interval) and isinstance(y, Interval):
+            return _interval_mul(x, _interval_reciprocal(y))
+        like = _template(x, y)
+        return _mul(_promote(x, like), _reciprocal(_promote(y, like)))
     if isinstance(y, AffineBound):
         return _mul(x, _reciprocal(y))
     if isinstance(x, AffineBound):
         return _scale(x, 1 / y)
+    if isinstance(x, Interval) or isinstance(y, Interval):
+        return _interval_mul(x, _interval_reciprocal(y))
     return x / y
 
 
@@ -453,6 +650,7 @@ def _log(x, accuracy=None):
     )
     t = 1 / ms
     out = _relax(x, ms, jnp.log(sl) - ms * sl, ms, jnp.log(t) - ms * t)
+    out = _degenerate_exact(out, x, jnp.log)
     top = _constant_interval_bounds(-jnp.inf, jnp.inf, x)
     return _select_affine(l > 0, out, top)
 
@@ -469,6 +667,7 @@ def _log1p(x, accuracy=None):
     )
     t = 1 / ms - 1
     out = _relax(x, ms, jnp.log1p(sl) - ms * sl, ms, jnp.log1p(t) - ms * t)
+    out = _degenerate_exact(out, x, jnp.log1p)
     return _select_affine(l > -1, out, _constant_interval_bounds(-jnp.inf, jnp.inf, x))
 
 
@@ -481,6 +680,7 @@ def _sqrt(x, accuracy=None):
     ms = jnp.where(d == 0, 1, (jnp.sqrt(su) - jnp.sqrt(sl)) / jnp.where(d == 0, 1, d))
     t = 1 / (4 * ms**2)
     out = _relax(x, ms, jnp.sqrt(sl) - ms * sl, ms, jnp.sqrt(t) - ms * t)
+    out = _degenerate_exact(out, x, jnp.sqrt)
     return _select_affine(l >= 0, out, _constant_interval_bounds(-jnp.inf, jnp.inf, x))
 
 
@@ -555,7 +755,8 @@ def _abs(x):
     positive = x
     negative = _neg(x)
     cross = _relax(x, 0, 0, ms, sec_c)
-    return _select_affine(crossing, cross, _select_affine(l >= 0, positive, negative))
+    out = _select_affine(crossing, cross, _select_affine(l >= 0, positive, negative))
+    return _degenerate_exact(out, x, jnp.abs)
 
 
 affine_inclusion_registry[lax.exp_p] = _exp
@@ -670,6 +871,7 @@ def _tan(x, accuracy=None):
     )
     mixed = _constant_interval_bounds(jnp.tan(l), jnp.tan(u), x)
     in_branch = _select_affine(jnp.logical_or(left, right), regular, mixed)
+    in_branch = _degenerate_exact(in_branch, x, jnp.tan)
     out = _select_affine(
         valid, in_branch, _constant_interval_bounds(-jnp.inf, jnp.inf, x)
     )
@@ -739,6 +941,7 @@ def _asin(x, accuracy=None):
         _constant_interval_bounds(jnp.arcsin(sl), jnp.arcsin(su), x),
         regular,
     )
+    in_domain = _degenerate_exact(in_domain, x, jnp.arcsin)
     out = _select_affine(
         jnp.logical_and(l >= -1, u <= 1),
         in_domain,
@@ -771,11 +974,12 @@ def _pow(x, y):
     max_zero = jnp.where(xu >= 1, xu**yu, xu**yl)
     zero_result = _constant_interval_bounds(jnp.zeros_like(max_zero), max_zero, like)
     fallback = _constant_interval_bounds(-jnp.inf, jnp.inf, like)
-    return _select_affine(
+    result = _select_affine(
         strictly_positive,
         positive_result,
         _select_affine(jnp.logical_and(zero_base, positive_exp), zero_result, fallback),
     )
+    return _jointly_degenerate_exact(result, (x, y), jnp.power)
 
 
 affine_inclusion_registry[lax.tanh_p] = _tanh
@@ -1790,6 +1994,12 @@ def _reduce_min(x, *, axes):
 
 def _reduce_bool(x, *, axes, is_and):
     primitive = lax.reduce_and_p if is_and else lax.reduce_or_p
+    if isinstance(x, AffineBound):
+        definitely_true = jnp.logical_or(x.lower > 0, x.upper < 0)
+        possibly_true = jnp.logical_not(
+            jnp.logical_and(x.lower == 0, x.upper == 0)
+        )
+        x = Interval(definitely_true, possibly_true)
     if not isinstance(x, Interval):
         return primitive.bind(x, axes=axes)
     return Interval(
@@ -1800,9 +2010,16 @@ def _reduce_bool(x, *, axes, is_and):
 def _dot_general(a, b, **kwargs):
     primitive = lax.dot_general_p
     if not isinstance(a, AffineBound) and not isinstance(b, AffineBound):
+        if isinstance(a, Interval) or isinstance(b, Interval):
+            # Reuse the natural rule when both operands have already lost
+            # affine source information, for example after a mixed predicate
+            # selects between point-valued arrays.
+            from . import nif
+
+            return nif.inclusion_registry[primitive](a, b, **kwargs)
         return primitive.bind(a, b, **kwargs)
     like = _template(a, b)
-    if isinstance(a, AffineBound) and not isinstance(b, AffineBound):
+    if isinstance(a, AffineBound) and not isinstance(b, (AffineBound, Interval)):
         bp, bn = jnp.maximum(b, 0), jnp.minimum(b, 0)
         dotc = lambda c, w: jax.vmap(
             lambda ci: primitive.bind(ci, w, **kwargs), in_axes=-1, out_axes=-1
@@ -1816,7 +2033,7 @@ def _dot_general(a, b, **kwargs):
             + primitive.bind(a.lower_bias, bn, **kwargs),
             like,
         )
-    if isinstance(b, AffineBound) and not isinstance(a, AffineBound):
+    if isinstance(b, AffineBound) and not isinstance(a, (AffineBound, Interval)):
         ap, an = jnp.maximum(a, 0), jnp.minimum(a, 0)
         dotc = lambda w, c: jax.vmap(
             lambda ci: primitive.bind(w, ci, **kwargs), in_axes=-1, out_axes=-1
@@ -1831,6 +2048,7 @@ def _dot_general(a, b, **kwargs):
             like,
         )
 
+    a, b = _promote(a, like), _promote(b, like)
     (ac, bc), (ab, bb) = kwargs["dimension_numbers"]
     a = _moveaxis(a, ab + ac, tuple(range(len(ab) + len(ac))))
     b = _moveaxis(b, bb + bc, tuple(range(len(bb) + len(bc))))
@@ -1888,6 +2106,15 @@ affine_inclusion_registry[lax.reduce_or_p] = lambda x, *, axes: _reduce_bool(
     x, axes=axes, is_and=False
 )
 affine_inclusion_registry[lax.dot_general_p] = _dot_general
+
+# Python ``@`` can be evaluated directly inside a custom affine inclusion
+# rule, before a surrounding Jaxpr has a chance to lower it to ``dot_general``.
+# Route that operator through the same registered affine interpreter used by
+# ordinary traced ``jnp.matmul`` calls.
+_matmul_affine = affif(jnp.matmul, return_type="affine")
+AffineBound.__matmul__ = _matmul_affine
+AffineBound.__rmatmul__ = lambda self, other: _matmul_affine(other, self)
+
 # The recursive enclosures are tighter on the regression boxes below.  Keep
 # the matrix-level implementations available for experimentation, but do not
 # register them as the public ``affif`` defaults.
@@ -1916,7 +2143,7 @@ def _atan2(y, x):
     result = _select_affine(y.upper < 0, lower_half, result)
     result = _select_affine(y.lower > 0, upper_half, result)
     result = _select_affine(x.lower > 0, right, result)
-    return result
+    return _jointly_degenerate_exact(result, (y, x), jnp.arctan2)
 
 
 if hasattr(lax, "clamp_p"):

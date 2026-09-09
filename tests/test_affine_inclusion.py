@@ -3,6 +3,7 @@ import itertools
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from jax._src.lax import linalg as LA
 
@@ -95,6 +96,78 @@ def test_affif_unary_relaxations_are_sound(function, lower, upper):
     _check_samples(function, box, result)
 
 
+@pytest.mark.parametrize(
+    ("function", "values"),
+    [
+        (jnp.exp, [-2.0, 0.0, 1.5]),
+        (jnp.log, [0.2, 1.0, 3.0]),
+        (jnp.log1p, [-0.8, 0.0, 2.0]),
+        (jnp.sqrt, [0.0, 0.25, 1.0, 4.0]),
+        (lambda x: 1 / x, [-3.0, -0.2, 0.2, 3.0]),
+        (lambda x: x**4, [-2.0, 0.0, 3.0]),
+        (jnp.abs, [-2.0, 0.0, 3.0]),
+        (jnp.tanh, [-2.0, 0.0, 2.0]),
+        (jnp.sin, [-2.0, 0.0, 2.0]),
+        (jnp.cos, [-2.0, 0.0, 2.0]),
+        (jnp.tan, [-0.9, 0.0, 0.9]),
+        (jnp.arctan, [-3.0, 0.0, 2.0]),
+        (jnp.arcsin, [-1.0, -0.9, 0.0, 0.8, 1.0]),
+        (lambda x: x**1.5, [0.1, 1.0, 3.0]),
+    ],
+)
+def test_affif_unary_point_inputs_are_exact(function, values):
+    point = jnp.asarray(values)
+    result = irx.affif(function)(irx.interval(point, point))
+    expected = function(point)
+
+    assert jnp.allclose(result.lower, expected)
+    assert jnp.allclose(result.upper, expected)
+
+
+@pytest.mark.parametrize(
+    ("function", "left", "right"),
+    [
+        (jnp.power, 0.0, 2.0),
+        (jnp.power, 2.0, 0.5),
+        (jnp.arctan2, 0.0, 0.0),
+        (jnp.arctan2, 1.0, -1.0),
+    ],
+)
+def test_affif_binary_point_inputs_are_exact(function, left, right):
+    left = jnp.asarray(left)
+    right = jnp.asarray(right)
+    result = irx.affif(function)(
+        irx.interval(left, left), irx.interval(right, right)
+    )
+    expected = function(left, right)
+
+    assert jnp.allclose(result.lower, expected)
+    assert jnp.allclose(result.upper, expected)
+
+
+def test_affif_point_valued_intermediate_nonlinear_ops_are_exact():
+    box = irx.interval(jnp.array([-1.0]), jnp.array([1.0]))
+
+    def function(source):
+        zero = 0.0 * source[0]
+        one = zero + 1.0
+        return jnp.array(
+            [
+                jnp.sqrt(one),
+                jnp.tan(zero + 0.9),
+                jnp.arcsin(one),
+                jnp.power(zero, zero + 2.0),
+                jnp.arctan2(zero, zero),
+            ]
+        )
+
+    result = irx.affif(function)(box)
+    expected = function(jnp.zeros_like(box.lower))
+
+    assert jnp.allclose(result.lower, expected)
+    assert jnp.allclose(result.upper, expected)
+
+
 def test_affif_tensor_operations_and_uncertain_dot_product():
     box = irx.interval(jnp.array([-1.0, 0.5]), jnp.array([2.0, 3.0]))
 
@@ -105,6 +178,37 @@ def test_affif_tensor_operations_and_uncertain_dot_product():
     result = irx.affif(function)(box)
     assert result.shape == ()
     _check_samples(function, box, result)
+
+
+@pytest.mark.parametrize(
+    "left_shape,right_shape",
+    [
+        ((2,), (2,)),
+        ((2, 2), (2,)),
+        ((2,), (2, 2)),
+        ((2, 2), (2, 2)),
+    ],
+)
+def test_affine_bound_matmul_operator_uses_dot_general_rule(
+    left_shape, right_shape
+):
+    box = irx.interval(jnp.array([-1.0, 0.5]), jnp.array([2.0, 3.0]))
+    source = irx.interval_to_affine_bound(box)
+    left_size = int(np.prod(left_shape))
+    right_size = int(np.prod(right_shape))
+    left_indices = jnp.arange(left_size) % source.size
+    right_indices = jnp.arange(right_size) % source.size
+    left = source[left_indices].reshape(left_shape)
+    right = source[::-1][right_indices].reshape(right_shape)
+
+    direct = left @ right
+    transformed = irx.affif(
+        jnp.matmul, return_type="affine"
+    )(left, right)
+
+    assert isinstance(direct, irx.AffineBound)
+    assert jnp.allclose(direct.lower, transformed.lower)
+    assert jnp.allclose(direct.upper, transformed.upper)
 
 
 def test_affif_uncertain_index_and_multiway_selection():

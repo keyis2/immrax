@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from functools import wraps
-from typing import Any, Literal as TypingLiteral, overload
+from typing import Any, overload
+from typing import Literal as TypingLiteral
 
 import equinox as eqx
 import jax
@@ -73,15 +74,7 @@ def _constant_interval_bounds(lower, upper, like: AffineBound) -> AffineBound:
 
 
 def _select_affine(mask, yes: AffineBound, no: AffineBound) -> AffineBound:
-    mask = jnp.asarray(mask)
-    cmask = mask[..., None]
-    return _new(
-        jnp.where(cmask, yes.lower_coeff, no.lower_coeff),
-        jnp.where(mask, yes.lower_bias, no.lower_bias),
-        jnp.where(cmask, yes.upper_coeff, no.upper_coeff),
-        jnp.where(mask, yes.upper_bias, no.upper_bias),
-        yes,
-    )
+    return AffineBound.select(mask, yes, no)
 
 
 def _evaluate(coeff, bias, point):

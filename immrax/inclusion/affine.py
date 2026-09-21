@@ -15,11 +15,29 @@ def _tighter_concretized_planes(first: AffineBound, second: AffineBound) -> Affi
     """Select each complete affine endpoint by its source-box extremum."""
     use_first_lower = first.lower >= second.lower
     use_first_upper = first.upper <= second.upper
+    first_lower = jnp.concatenate(
+        (first.lower_coeff, first.lower_bias[..., None]), axis=-1
+    )
+    second_lower = jnp.concatenate(
+        (second.lower_coeff, second.lower_bias[..., None]), axis=-1
+    )
+    first_upper = jnp.concatenate(
+        (first.upper_coeff, first.upper_bias[..., None]), axis=-1
+    )
+    second_upper = jnp.concatenate(
+        (second.upper_coeff, second.upper_bias[..., None]), axis=-1
+    )
+    lower_plane = jnp.where(
+        use_first_lower[..., None], first_lower, second_lower
+    )
+    upper_plane = jnp.where(
+        use_first_upper[..., None], first_upper, second_upper
+    )
     return AffineBound(
-        jnp.where(use_first_lower[..., None], first.lower_coeff, second.lower_coeff),
-        jnp.where(use_first_lower, first.lower_bias, second.lower_bias),
-        jnp.where(use_first_upper[..., None], first.upper_coeff, second.upper_coeff),
-        jnp.where(use_first_upper, first.upper_bias, second.upper_bias),
+        lower_plane[..., :-1],
+        lower_plane[..., -1],
+        upper_plane[..., :-1],
+        upper_plane[..., -1],
         first.domain_lower,
         first.domain_upper,
     )
@@ -276,23 +294,20 @@ def _adaptive_zonotope_source_plane_product(
     _, upper_endpoint = template.plane_extrema(coeff, upper_bias)
     lower_index = jnp.argmax(lower_endpoint, axis=-1)
     upper_index = jnp.argmin(upper_endpoint, axis=-1)
-    lower_coeff = jnp.take_along_axis(
-        coeff, lower_index[..., None, None], axis=-2
+    # Keep each selected coefficient and bias coupled as one affine plane.
+    lower_plane = jnp.concatenate((coeff, lower_bias[..., None]), axis=-1)
+    upper_plane = jnp.concatenate((coeff, upper_bias[..., None]), axis=-1)
+    lower_plane = jnp.take_along_axis(
+        lower_plane, lower_index[..., None, None], axis=-2
     )[..., 0, :]
-    upper_coeff = jnp.take_along_axis(
-        coeff, upper_index[..., None, None], axis=-2
+    upper_plane = jnp.take_along_axis(
+        upper_plane, upper_index[..., None, None], axis=-2
     )[..., 0, :]
-    lower_bias = jnp.take_along_axis(
-        lower_bias, lower_index[..., None], axis=-1
-    )[..., 0]
-    upper_bias = jnp.take_along_axis(
-        upper_bias, upper_index[..., None], axis=-1
-    )[..., 0]
     adaptive = AffineBound(
-        lower_coeff,
-        lower_bias,
-        upper_coeff,
-        upper_bias,
+        lower_plane[..., :-1],
+        lower_plane[..., -1],
+        upper_plane[..., :-1],
+        upper_plane[..., -1],
         template.domain_lower,
         template.domain_upper,
     )
@@ -1316,12 +1331,26 @@ class AffineBound:
         if if_true.domain_lower.shape != if_false.domain_lower.shape:
             raise ValueError("AffineBound source-domain shapes must match.")
         condition = jnp.asarray(condition)
-        coeff_condition = condition if condition.ndim == 0 else condition[..., None]
+        plane_condition = condition[..., None]
+        true_lower = jnp.concatenate(
+            (if_true.lower_coeff, if_true.lower_bias[..., None]), axis=-1
+        )
+        false_lower = jnp.concatenate(
+            (if_false.lower_coeff, if_false.lower_bias[..., None]), axis=-1
+        )
+        true_upper = jnp.concatenate(
+            (if_true.upper_coeff, if_true.upper_bias[..., None]), axis=-1
+        )
+        false_upper = jnp.concatenate(
+            (if_false.upper_coeff, if_false.upper_bias[..., None]), axis=-1
+        )
+        lower_plane = jnp.where(plane_condition, true_lower, false_lower)
+        upper_plane = jnp.where(plane_condition, true_upper, false_upper)
         return AffineBound(
-            jnp.where(coeff_condition, if_true.lower_coeff, if_false.lower_coeff),
-            jnp.where(condition, if_true.lower_bias, if_false.lower_bias),
-            jnp.where(coeff_condition, if_true.upper_coeff, if_false.upper_coeff),
-            jnp.where(condition, if_true.upper_bias, if_false.upper_bias),
+            lower_plane[..., :-1],
+            lower_plane[..., -1],
+            upper_plane[..., :-1],
+            upper_plane[..., -1],
             if_true.domain_lower,
             if_true.domain_upper,
         )

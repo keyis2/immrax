@@ -544,110 +544,109 @@ def _mul_mccormick_baseline(
     )
 
 
-def _mccormick_source_candidates(
-    x: AffineBound,
-    y: AffineBound,
+def _linear_sign_interval(value_0, value_1, nonnegative, lower, upper, valid):
+    """Intersect an r interval with one affine sign condition."""
+    has_slope = value_1 != 0
+    root = -value_0 / jnp.where(has_slope, value_1, 1)
+    if nonnegative:
+        lower = jnp.where(value_1 > 0, jnp.maximum(lower, root), lower)
+        upper = jnp.where(value_1 < 0, jnp.minimum(upper, root), upper)
+        valid = valid & (has_slope | (value_0 >= 0))
+    else:
+        upper = jnp.where(value_1 > 0, jnp.minimum(upper, root), upper)
+        lower = jnp.where(value_1 < 0, jnp.maximum(lower, root), lower)
+        valid = valid & (has_slope | (value_0 <= 0))
+    lower = jnp.maximum(lower, 0.0)
+    upper = jnp.minimum(upper, 1.0)
+    return lower, upper, valid & (lower <= upper)
+
+
+def _piecewise_endpoint_optimum(
+    coeff_0,
+    coeff_1,
+    bias_1,
+    region_lower,
+    region_upper,
     like: AffineBound,
     *,
     lower: bool,
 ):
-    """Return continuous-r McCormick candidates and validity masks.
+    """Optimize one affine-in-r source-box endpoint with O(n) storage.
 
-    This supports the experimental source-optimized multiplication rule below.
+    Nearly flat endpoint objectives canonically select the left boundary. This
+    keeps algebraically tied optima stable under JIT reassociation; any point
+    in the tied region is an equally valid McCormick interpolant.
     """
-    output_shape = jnp.broadcast_shapes(x.shape, y.shape)
-    source_size = like.input_size
-    coeff_shape = output_shape + (source_size,)
-    pl, pu, ql, qu = [
-        jnp.broadcast_to(value, output_shape)
-        for value in jnp.broadcast_arrays(x.lower, x.upper, y.lower, y.upper)
-    ]
-    dtype = jnp.result_type(
-        x.lower_coeff,
-        x.lower_bias,
-        x.upper_coeff,
-        x.upper_bias,
-        y.lower_coeff,
-        y.lower_bias,
-        y.upper_coeff,
-        y.upper_bias,
+    source_magnitude = jnp.maximum(
+        jnp.abs(like.domain_lower), jnp.abs(like.domain_upper)
     )
-
-    def broadcast_coeff(value):
-        return jnp.broadcast_to(jnp.asarray(value, dtype=dtype), coeff_shape)
-
-    x_lower_coeff = broadcast_coeff(x.lower_coeff)
-    x_upper_coeff = broadcast_coeff(x.upper_coeff)
-    y_lower_coeff = broadcast_coeff(y.lower_coeff)
-    y_upper_coeff = broadcast_coeff(y.upper_coeff)
-
-    if lower:
-        alpha_0, alpha_1 = qu, ql - qu
-        beta_0, beta_1 = pu, pl - pu
-    else:
-        alpha_0, alpha_1 = ql, qu - ql
-        beta_0, beta_1 = pu, pl - pu
-
-    pattern_candidates = []
-    pattern_valid = []
-    for alpha_nonnegative, beta_nonnegative in (
-        (True, True),
-        (True, False),
-        (False, True),
-        (False, False),
-    ):
+    derivative_scale = 1.0 + jnp.abs(bias_1) + jnp.sum(
+        jnp.abs(coeff_1) * source_magnitude, axis=-1
+    )
+    derivative_tolerance = (
+        128.0 * jnp.finfo(derivative_scale.dtype).eps * derivative_scale
+    )
+    if like.input_size == 0:
         if lower:
-            x_coeff = x_lower_coeff if alpha_nonnegative else x_upper_coeff
-            y_coeff = y_lower_coeff if beta_nonnegative else y_upper_coeff
-        else:
-            x_coeff = x_upper_coeff if alpha_nonnegative else x_lower_coeff
-            y_coeff = y_upper_coeff if beta_nonnegative else y_lower_coeff
-        coeff_0 = alpha_0[..., None] * x_coeff + beta_0[..., None] * y_coeff
-        coeff_1 = alpha_1[..., None] * x_coeff + beta_1[..., None] * y_coeff
-        has_root = coeff_1 != 0
-        root = -coeff_0 / jnp.where(has_root, coeff_1, 1)
-        alpha_at_root = alpha_0[..., None] + root * alpha_1[..., None]
-        beta_at_root = beta_0[..., None] + root * beta_1[..., None]
-        alpha_matches = (
-            alpha_at_root >= 0 if alpha_nonnegative else alpha_at_root < 0
+            return jnp.where(
+                bias_1 <= derivative_tolerance,
+                region_lower,
+                region_upper,
+            )
+        return jnp.where(
+            bias_1 >= -derivative_tolerance,
+            region_lower,
+            region_upper,
         )
-        beta_matches = beta_at_root >= 0 if beta_nonnegative else beta_at_root < 0
-        valid = (
-            has_root
-            & (root > 0)
-            & (root < 1)
-            & alpha_matches
-            & beta_matches
+
+    coeff_at_lower = coeff_0 + region_lower[..., None] * coeff_1
+    right_nonnegative = (coeff_at_lower > 0) | (
+        (coeff_at_lower == 0) & (coeff_1 >= 0)
+    )
+    source = jnp.where(
+        right_nonnegative,
+        like.domain_lower if lower else like.domain_upper,
+        like.domain_upper if lower else like.domain_lower,
+    )
+    derivative = bias_1 + jnp.sum(coeff_1 * source, axis=-1)
+    has_root = coeff_1 != 0
+    roots = -coeff_0 / jnp.where(has_root, coeff_1, 1)
+    root_valid = (
+        has_root & (roots > region_lower[..., None])
+        & (roots < region_upper[..., None]) & jnp.isfinite(roots)
+    )
+    sortable = jnp.where(root_valid, roots, jnp.inf)
+    order = jnp.argsort(sortable, axis=-1)
+    sorted_roots = jnp.take_along_axis(sortable, order, axis=-1)
+    width = like.domain_upper - like.domain_lower
+    jumps = jnp.where(root_valid, jnp.abs(coeff_1) * width, 0.0)
+    sorted_jumps = jnp.take_along_axis(jumps, order, axis=-1)
+    if lower:
+        derivative_after = derivative[..., None] - jnp.cumsum(
+            sorted_jumps, axis=-1
         )
-        pattern_candidates.append(jnp.moveaxis(jnp.where(valid, root, 0), -1, 0))
-        pattern_valid.append(jnp.moveaxis(valid, -1, 0))
-
-    singleton_shape = (1,) + output_shape
-    zeros = jnp.zeros(singleton_shape, dtype=dtype)
-    ones = jnp.ones(singleton_shape, dtype=dtype)
-
-    def coefficient_zero(coefficient_0, coefficient_1):
-        has_root = coefficient_1 != 0
-        root = -coefficient_0 / jnp.where(has_root, coefficient_1, 1)
-        valid = has_root & (root >= 0) & (root <= 1)
-        return jnp.where(valid, root, 0)[None, ...], valid[None, ...]
-
-    alpha_root, alpha_valid = coefficient_zero(alpha_0, alpha_1)
-    beta_root, beta_valid = coefficient_zero(beta_0, beta_1)
-    candidates = jnp.concatenate(
-        (*pattern_candidates, zeros, ones, alpha_root, beta_root), axis=0
+        crosses = jnp.isfinite(sorted_roots) & (
+            derivative_after <= derivative_tolerance[..., None]
+        )
+        starts_optimal = derivative <= derivative_tolerance
+    else:
+        derivative_after = derivative[..., None] + jnp.cumsum(
+            sorted_jumps, axis=-1
+        )
+        crosses = jnp.isfinite(sorted_roots) & (
+            derivative_after >= -derivative_tolerance[..., None]
+        )
+        starts_optimal = derivative >= -derivative_tolerance
+    has_crossing = jnp.any(crosses, axis=-1)
+    first_crossing = jnp.argmax(crosses, axis=-1)
+    crossing = jnp.take_along_axis(
+        sorted_roots, first_crossing[..., None], axis=-1
+    )[..., 0]
+    return jnp.where(
+        starts_optimal,
+        region_lower,
+        jnp.where(has_crossing, crossing, region_upper),
     )
-    valid = jnp.concatenate(
-        (
-            *pattern_valid,
-            jnp.ones(singleton_shape, dtype=bool),
-            jnp.ones(singleton_shape, dtype=bool),
-            alpha_valid,
-            beta_valid,
-        ),
-        axis=0,
-    )
-    return candidates, valid, (pl, pu, ql, qu)
 
 
 def _select_mccormick_source_side(
@@ -657,36 +656,107 @@ def _select_mccormick_source_side(
     *,
     lower: bool,
 ):
-    """Exactly optimize one source-concretized continuous-r family side."""
-    candidates, valid, (pl, pu, ql, qu) = _mccormick_source_candidates(
-        x, y, like, lower=lower
-    )
-    if lower:
-        alpha = qu[None, ...] + candidates * (ql - qu)[None, ...]
-        beta = pu[None, ...] + candidates * (pl - pu)[None, ...]
-        constant = -pu * qu + candidates * (pu * qu - pl * ql)[None, ...]
-        coeff, bias = _affine_lower_plane(
-            ((alpha, x), (beta, y)), constant, like
-        )
-        scores, _ = like.plane_extrema(coeff, bias)
-        scores = jnp.where(valid, scores, -jnp.inf)
-        selected = jnp.argmax(scores, axis=0)
-    else:
-        alpha = ql[None, ...] + candidates * (qu - ql)[None, ...]
-        beta = pu[None, ...] + candidates * (pl - pu)[None, ...]
-        constant = -pu * ql + candidates * (pu * ql - pl * qu)[None, ...]
-        coeff, bias = _affine_upper_plane(
-            ((alpha, x), (beta, y)), constant, like
-        )
-        _, scores = like.plane_extrema(coeff, bias)
-        scores = jnp.where(valid, scores, jnp.inf)
-        selected = jnp.argmin(scores, axis=0)
+    """Optimize one continuous-r side in O(n log n) time and O(n) space."""
+    output_shape = jnp.broadcast_shapes(x.shape, y.shape)
+    coeff_shape = output_shape + (like.input_size,)
+    pl, pu, ql, qu = [
+        jnp.broadcast_to(value, output_shape)
+        for value in jnp.broadcast_arrays(x.lower, x.upper, y.lower, y.upper)
+    ]
 
-    selected_coeff = jnp.take_along_axis(
-        coeff, selected[None, ..., None], axis=0
+    def broadcast_coeff(value):
+        return jnp.broadcast_to(value, coeff_shape)
+
+    if lower:
+        alpha_0, alpha_1 = qu, ql - qu
+        beta_0, beta_1 = pu, pl - pu
+        constant_0, constant_1 = -pu * qu, pu * qu - pl * ql
+    else:
+        alpha_0, alpha_1 = ql, qu - ql
+        beta_0, beta_1 = pu, pl - pu
+        constant_0, constant_1 = -pu * ql, pu * ql - pl * qu
+
+    pattern_plane = []
+    pattern_score = []
+    for alpha_nonnegative, beta_nonnegative in (
+        (True, True),
+        (True, False),
+        (False, True),
+        (False, False),
+    ):
+        region_lower = jnp.zeros(output_shape)
+        region_upper = jnp.ones(output_shape)
+        valid = jnp.ones(output_shape, dtype=bool)
+        region_lower, region_upper, valid = _linear_sign_interval(
+            alpha_0, alpha_1, alpha_nonnegative,
+            region_lower, region_upper, valid,
+        )
+        region_lower, region_upper, valid = _linear_sign_interval(
+            beta_0, beta_1, beta_nonnegative,
+            region_lower, region_upper, valid,
+        )
+        if lower:
+            x_coeff = broadcast_coeff(
+                x.lower_coeff if alpha_nonnegative else x.upper_coeff
+            )
+            x_bias = jnp.broadcast_to(
+                x.lower_bias if alpha_nonnegative else x.upper_bias,
+                output_shape,
+            )
+            y_coeff = broadcast_coeff(
+                y.lower_coeff if beta_nonnegative else y.upper_coeff
+            )
+            y_bias = jnp.broadcast_to(
+                y.lower_bias if beta_nonnegative else y.upper_bias,
+                output_shape,
+            )
+        else:
+            x_coeff = broadcast_coeff(
+                x.upper_coeff if alpha_nonnegative else x.lower_coeff
+            )
+            x_bias = jnp.broadcast_to(
+                x.upper_bias if alpha_nonnegative else x.lower_bias,
+                output_shape,
+            )
+            y_coeff = broadcast_coeff(
+                y.upper_coeff if beta_nonnegative else y.lower_coeff
+            )
+            y_bias = jnp.broadcast_to(
+                y.upper_bias if beta_nonnegative else y.lower_bias,
+                output_shape,
+            )
+        coeff_0 = alpha_0[..., None] * x_coeff + beta_0[..., None] * y_coeff
+        coeff_1 = alpha_1[..., None] * x_coeff + beta_1[..., None] * y_coeff
+        bias_0 = alpha_0 * x_bias + beta_0 * y_bias + constant_0
+        bias_1 = alpha_1 * x_bias + beta_1 * y_bias + constant_1
+        r = _piecewise_endpoint_optimum(
+            coeff_0, coeff_1, bias_1,
+            region_lower, region_upper, like, lower=lower,
+        )
+        # Keep the coefficient and bias coupled to one numerical value of r.
+        packed_0 = jnp.concatenate((coeff_0, bias_0[..., None]), axis=-1)
+        packed_1 = jnp.concatenate((coeff_1, bias_1[..., None]), axis=-1)
+        packed = packed_0 + r[..., None] * packed_1
+        coeff = packed[..., :-1]
+        bias = packed[..., -1]
+        if lower:
+            score, _ = like.plane_extrema(coeff, bias)
+            score = jnp.where(valid, score, -jnp.inf)
+        else:
+            _, score = like.plane_extrema(coeff, bias)
+            score = jnp.where(valid, score, jnp.inf)
+        pattern_plane.append(packed)
+        pattern_score.append(score)
+
+    # Select one complete [coefficient, bias] candidate. Separate gathers can
+    # splice together different tied candidates after JIT reassociation.
+    plane = jnp.stack(pattern_plane, axis=0)
+    score = jnp.stack(pattern_score, axis=0)
+    selected = jnp.argmax(score, axis=0) if lower else jnp.argmin(score, axis=0)
+    selected_plane = jnp.take_along_axis(
+        plane, selected[None, ..., None], axis=0
     )[0]
-    selected_bias = jnp.take_along_axis(bias, selected[None, ...], axis=0)[0]
-    return selected_coeff, selected_bias
+    return selected_plane[..., :-1], selected_plane[..., -1]
 
 
 def _mul_mccormick_source_optimized(

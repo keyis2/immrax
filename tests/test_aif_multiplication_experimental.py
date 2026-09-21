@@ -150,13 +150,3 @@ def test_source_optimized_multiplication_supports_an_empty_source_domain():
 
     assert jnp.allclose(product.lower, -6.0)
     assert jnp.allclose(product.upper, 8.0)
-
-
-def test_source_optimized_candidate_count_is_linear_in_source_dimension():
-    template = irx.constant_affine_bound(1.0, -jnp.ones(3), jnp.ones(3))
-    candidates, valid, _ = aif._mccormick_source_candidates(
-        template, template, template, lower=True
-    )
-
-    assert candidates.shape == (4 * template.input_size + 4,)
-    assert valid.shape == candidates.shape

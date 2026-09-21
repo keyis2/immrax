@@ -516,6 +516,203 @@ def _scale(x: AffineBound, c) -> AffineBound:
     )
 
 
+# Experimental tracing-time choice for affine-by-affine multiplication.
+# Set it before tracing or JIT-compiling an ``affif`` function. Changing this
+# value does not invalidate already compiled JAX executables.
+_MUL_RELAXATION = "baseline"
+
+
+def _mul_mccormick_baseline(
+    x: AffineBound, y: AffineBound, like: AffineBound
+) -> AffineBound:
+    """Apply the original center-selected McCormick vertex relaxation."""
+    pl, pu, ql, qu = jnp.broadcast_arrays(x.lower, x.upper, y.lower, y.upper)
+    l1c, l1b = _affine_lower_plane(((ql, x), (pl, y)), -pl * ql, like)
+    l2c, l2b = _affine_lower_plane(((qu, x), (pu, y)), -pu * qu, like)
+    u1c, u1b = _affine_upper_plane(((ql, x), (pu, y)), -pu * ql, like)
+    u2c, u2b = _affine_upper_plane(((qu, x), (pl, y)), -pl * qu, like)
+    center = (like.domain_lower + like.domain_upper) / 2
+    choose_l1 = _evaluate(l1c, l1b, center) >= _evaluate(l2c, l2b, center)
+    choose_u1 = _evaluate(u1c, u1b, center) <= _evaluate(u2c, u2b, center)
+    return _new(
+        jnp.where(choose_l1[..., None], l1c, l2c),
+        jnp.where(choose_l1, l1b, l2b),
+        jnp.where(choose_u1[..., None], u1c, u2c),
+        jnp.where(choose_u1, u1b, u2b),
+        like,
+    )
+
+
+def _mccormick_source_candidates(
+    x: AffineBound,
+    y: AffineBound,
+    like: AffineBound,
+    *,
+    lower: bool,
+):
+    """Return continuous-r McCormick candidates and validity masks.
+
+    This supports the experimental source-optimized multiplication rule below.
+    """
+    output_shape = jnp.broadcast_shapes(x.shape, y.shape)
+    source_size = like.input_size
+    coeff_shape = output_shape + (source_size,)
+    pl, pu, ql, qu = [
+        jnp.broadcast_to(value, output_shape)
+        for value in jnp.broadcast_arrays(x.lower, x.upper, y.lower, y.upper)
+    ]
+    dtype = jnp.result_type(
+        x.lower_coeff,
+        x.lower_bias,
+        x.upper_coeff,
+        x.upper_bias,
+        y.lower_coeff,
+        y.lower_bias,
+        y.upper_coeff,
+        y.upper_bias,
+    )
+
+    def broadcast_coeff(value):
+        return jnp.broadcast_to(jnp.asarray(value, dtype=dtype), coeff_shape)
+
+    x_lower_coeff = broadcast_coeff(x.lower_coeff)
+    x_upper_coeff = broadcast_coeff(x.upper_coeff)
+    y_lower_coeff = broadcast_coeff(y.lower_coeff)
+    y_upper_coeff = broadcast_coeff(y.upper_coeff)
+
+    if lower:
+        alpha_0, alpha_1 = qu, ql - qu
+        beta_0, beta_1 = pu, pl - pu
+    else:
+        alpha_0, alpha_1 = ql, qu - ql
+        beta_0, beta_1 = pu, pl - pu
+
+    pattern_candidates = []
+    pattern_valid = []
+    for alpha_nonnegative, beta_nonnegative in (
+        (True, True),
+        (True, False),
+        (False, True),
+        (False, False),
+    ):
+        if lower:
+            x_coeff = x_lower_coeff if alpha_nonnegative else x_upper_coeff
+            y_coeff = y_lower_coeff if beta_nonnegative else y_upper_coeff
+        else:
+            x_coeff = x_upper_coeff if alpha_nonnegative else x_lower_coeff
+            y_coeff = y_upper_coeff if beta_nonnegative else y_lower_coeff
+        coeff_0 = alpha_0[..., None] * x_coeff + beta_0[..., None] * y_coeff
+        coeff_1 = alpha_1[..., None] * x_coeff + beta_1[..., None] * y_coeff
+        has_root = coeff_1 != 0
+        root = -coeff_0 / jnp.where(has_root, coeff_1, 1)
+        alpha_at_root = alpha_0[..., None] + root * alpha_1[..., None]
+        beta_at_root = beta_0[..., None] + root * beta_1[..., None]
+        alpha_matches = (
+            alpha_at_root >= 0 if alpha_nonnegative else alpha_at_root < 0
+        )
+        beta_matches = beta_at_root >= 0 if beta_nonnegative else beta_at_root < 0
+        valid = (
+            has_root
+            & (root > 0)
+            & (root < 1)
+            & alpha_matches
+            & beta_matches
+        )
+        pattern_candidates.append(jnp.moveaxis(jnp.where(valid, root, 0), -1, 0))
+        pattern_valid.append(jnp.moveaxis(valid, -1, 0))
+
+    singleton_shape = (1,) + output_shape
+    zeros = jnp.zeros(singleton_shape, dtype=dtype)
+    ones = jnp.ones(singleton_shape, dtype=dtype)
+
+    def coefficient_zero(coefficient_0, coefficient_1):
+        has_root = coefficient_1 != 0
+        root = -coefficient_0 / jnp.where(has_root, coefficient_1, 1)
+        valid = has_root & (root >= 0) & (root <= 1)
+        return jnp.where(valid, root, 0)[None, ...], valid[None, ...]
+
+    alpha_root, alpha_valid = coefficient_zero(alpha_0, alpha_1)
+    beta_root, beta_valid = coefficient_zero(beta_0, beta_1)
+    candidates = jnp.concatenate(
+        (*pattern_candidates, zeros, ones, alpha_root, beta_root), axis=0
+    )
+    valid = jnp.concatenate(
+        (
+            *pattern_valid,
+            jnp.ones(singleton_shape, dtype=bool),
+            jnp.ones(singleton_shape, dtype=bool),
+            alpha_valid,
+            beta_valid,
+        ),
+        axis=0,
+    )
+    return candidates, valid, (pl, pu, ql, qu)
+
+
+def _select_mccormick_source_side(
+    x: AffineBound,
+    y: AffineBound,
+    like: AffineBound,
+    *,
+    lower: bool,
+):
+    """Exactly optimize one source-concretized continuous-r family side."""
+    candidates, valid, (pl, pu, ql, qu) = _mccormick_source_candidates(
+        x, y, like, lower=lower
+    )
+    if lower:
+        alpha = qu[None, ...] + candidates * (ql - qu)[None, ...]
+        beta = pu[None, ...] + candidates * (pl - pu)[None, ...]
+        constant = -pu * qu + candidates * (pu * qu - pl * ql)[None, ...]
+        coeff, bias = _affine_lower_plane(
+            ((alpha, x), (beta, y)), constant, like
+        )
+        scores, _ = like.plane_extrema(coeff, bias)
+        scores = jnp.where(valid, scores, -jnp.inf)
+        selected = jnp.argmax(scores, axis=0)
+    else:
+        alpha = ql[None, ...] + candidates * (qu - ql)[None, ...]
+        beta = pu[None, ...] + candidates * (pl - pu)[None, ...]
+        constant = -pu * ql + candidates * (pu * ql - pl * qu)[None, ...]
+        coeff, bias = _affine_upper_plane(
+            ((alpha, x), (beta, y)), constant, like
+        )
+        _, scores = like.plane_extrema(coeff, bias)
+        scores = jnp.where(valid, scores, jnp.inf)
+        selected = jnp.argmin(scores, axis=0)
+
+    selected_coeff = jnp.take_along_axis(
+        coeff, selected[None, ..., None], axis=0
+    )[0]
+    selected_bias = jnp.take_along_axis(bias, selected[None, ...], axis=0)[0]
+    return selected_coeff, selected_bias
+
+
+def _mul_mccormick_source_optimized(
+    x: AffineBound, y: AffineBound, like: AffineBound
+) -> AffineBound:
+    """Apply the experimental source-optimized continuous-r McCormick rule.
+
+    Every candidate is a sound McCormick interpolant, and sign-dependent
+    back-substitution supports factors with arbitrary signs. For each side,
+    the source-box endpoint is piecewise linear in ``r``. Its only possible
+    kinks are coefficient-zero and source-coefficient-zero points, so the
+    finite candidate set exactly optimizes this relaxation family. Because
+    ``r = 0`` and ``r = 1`` are always included, the concretized result
+    dominates both vertex McCormick planes.
+
+    The generic ``_mul`` path uses it only when ``_MUL_RELAXATION`` is set to
+    ``"source_optimized"`` before JAX traces the calling function.
+    """
+    lower_coeff, lower_bias = _select_mccormick_source_side(
+        x, y, like, lower=True
+    )
+    upper_coeff, upper_bias = _select_mccormick_source_side(
+        x, y, like, lower=False
+    )
+    return _new(lower_coeff, lower_bias, upper_coeff, upper_bias, like)
+
+
 def _mul(x, y):
     if (
         isinstance(x, AffineBound)
@@ -534,21 +731,13 @@ def _mul(x, y):
 
     like = _template(x, y)
     x, y = _promote(x, like), _promote(y, like)
-    pl, pu, ql, qu = jnp.broadcast_arrays(x.lower, x.upper, y.lower, y.upper)
-    # McCormick candidates, back-substituted through existing affine forms.
-    l1c, l1b = _affine_lower_plane(((ql, x), (pl, y)), -pl * ql, like)
-    l2c, l2b = _affine_lower_plane(((qu, x), (pu, y)), -pu * qu, like)
-    u1c, u1b = _affine_upper_plane(((ql, x), (pu, y)), -pu * ql, like)
-    u2c, u2b = _affine_upper_plane(((qu, x), (pl, y)), -pl * qu, like)
-    center = (like.domain_lower + like.domain_upper) / 2
-    choose_l1 = _evaluate(l1c, l1b, center) >= _evaluate(l2c, l2b, center)
-    choose_u1 = _evaluate(u1c, u1b, center) <= _evaluate(u2c, u2b, center)
-    return _new(
-        jnp.where(choose_l1[..., None], l1c, l2c),
-        jnp.where(choose_l1, l1b, l2b),
-        jnp.where(choose_u1[..., None], u1c, u2c),
-        jnp.where(choose_u1, u1b, u2b),
-        like,
+    if _MUL_RELAXATION == "baseline":
+        return _mul_mccormick_baseline(x, y, like)
+    if _MUL_RELAXATION == "source_optimized":
+        return _mul_mccormick_source_optimized(x, y, like)
+    raise ValueError(
+        f"Unsupported affine multiplication relaxation {_MUL_RELAXATION!r}; "
+        "expected 'baseline' or 'source_optimized'."
     )
 
 

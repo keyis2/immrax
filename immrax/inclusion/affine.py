@@ -11,6 +11,72 @@ from jaxtyping import ArrayLike
 from .interval import Interval
 
 
+def _tighter_concretized_planes(first: AffineBound, second: AffineBound) -> AffineBound:
+    """Select each complete affine endpoint by its source-box extremum."""
+    use_first_lower = first.lower >= second.lower
+    use_first_upper = first.upper <= second.upper
+    return AffineBound(
+        jnp.where(use_first_lower[..., None], first.lower_coeff, second.lower_coeff),
+        jnp.where(use_first_lower, first.lower_bias, second.lower_bias),
+        jnp.where(use_first_upper[..., None], first.upper_coeff, second.upper_coeff),
+        jnp.where(use_first_upper, first.upper_bias, second.upper_bias),
+        first.domain_lower,
+        first.domain_upper,
+    )
+
+
+def _bilinear_zonotope_edges(first_coeff, second_coeff, source_radius):
+    """Return boundary starts and steps for a two-dimensional zonotope."""
+    generators = jnp.stack(
+        (first_coeff * source_radius, second_coeff * source_radius), axis=-1
+    )
+    flip = (generators[..., 1] < 0.0) | (
+        (generators[..., 1] == 0.0) & (generators[..., 0] < 0.0)
+    )
+    oriented = jnp.where(flip[..., None], -generators, generators)
+    order = jnp.argsort(jnp.arctan2(oriented[..., 1], oriented[..., 0]), axis=-1)
+    ordered = jnp.take_along_axis(oriented, order[..., None], axis=-2)
+    steps = jnp.concatenate((2.0 * ordered, -2.0 * ordered), axis=-2)
+    previous_steps = jnp.concatenate(
+        (jnp.zeros_like(steps[..., :1, :]), jnp.cumsum(steps[..., :-1, :], axis=-2)),
+        axis=-2,
+    )
+    edge_start = -jnp.sum(ordered, axis=-2)[..., None, :] + previous_steps
+    radius = jnp.sum(jnp.abs(generators), axis=-2)
+    return edge_start, steps, radius
+
+
+def _bilinear_zonotope_extrema(first_coeff, second_coeff, source_radius):
+    """Exact extrema of ``(a.T @ xi) * (c.T @ xi)`` on a source box."""
+    edge_start, steps, _ = _bilinear_zonotope_edges(
+        first_coeff, second_coeff, source_radius
+    )
+    u0, v0 = edge_start[..., 0], edge_start[..., 1]
+    du, dv = steps[..., 0], steps[..., 1]
+    r0 = u0 * v0
+    r1 = u0 * dv + v0 * du
+    r2 = du * dv
+    stationary_t = -r1 / jnp.where(r2 != 0.0, 2.0 * r2, 1.0)
+    stationary_value = r0 + stationary_t * (r1 + stationary_t * r2)
+    interior = (r2 != 0.0) & (stationary_t >= 0.0) & (stationary_t <= 1.0)
+    minimum = jnp.min(
+        jnp.minimum(
+            jnp.minimum(r0, r0 + r1 + r2),
+            jnp.where(interior, stationary_value, jnp.inf),
+        ),
+        axis=-1,
+    )
+    maximum = jnp.max(
+        jnp.maximum(
+            jnp.maximum(r0, r0 + r1 + r2),
+            jnp.where(interior, stationary_value, -jnp.inf),
+        ),
+        axis=-1,
+    )
+    # The centered source box contains xi=0, so (u,v)=(0,0) is feasible.
+    return jnp.minimum(minimum, 0.0), jnp.maximum(maximum, 0.0)
+
+
 @register_pytree_node_class
 class AffineBound:
     """Componentwise affine lower and upper bounds over one input box.
@@ -104,6 +170,19 @@ class AffineBound:
             jnp.sum(positive * domain_upper + negative * domain_lower, axis=-1) + bias
         )
 
+    @staticmethod
+    def _interval_product(first_lower, first_upper, second_lower, second_upper):
+        products = jnp.stack(
+            (
+                first_lower * second_lower,
+                first_lower * second_upper,
+                first_upper * second_lower,
+                first_upper * second_upper,
+            ),
+            axis=0,
+        )
+        return jnp.min(products, axis=0), jnp.max(products, axis=0)
+
     @property
     def lower(self):
         """Concretized componentwise lower endpoint."""
@@ -176,7 +255,9 @@ class AffineBound:
         second_coeff: ArrayLike,
         second_bias: ArrayLike,
         *,
-        quadratic_relaxation: Literal["affine", "interval", "best"] = "interval",
+        quadratic_relaxation: Literal[
+            "affine", "interval", "zonotope", "best"
+        ] = "interval",
     ) -> AffineBound:
         """Bound the product of two affine planes in this source domain.
 
@@ -191,10 +272,12 @@ class AffineBound:
         tangent and endpoint secant, while each distinct-source product uses
         McCormick planes.  With ``quadratic_relaxation="interval"``, exact
         interval ranges of the individual quadratic terms are added to the
-        biases instead.  ``quadratic_relaxation="best"`` constructs both and
-        retains the complete lower and upper planes with the tighter
-        concretized endpoints.  The mode is a static tracing choice; all
-        paths use vectorized JAX operations.
+        biases instead. ``quadratic_relaxation="zonotope"`` optimizes the
+        centered bilinear remainder jointly over its two-dimensional source
+        zonotope, then selects against ``"interval"`` at each complete
+        endpoint. ``"best"`` selects between ``"zonotope"`` and ``"affine"``.
+        The mode is a static tracing choice; all paths use vectorized JAX
+        operations.
         """
         if quadratic_relaxation == "best":
             affine = self.product_of_source_planes(
@@ -204,34 +287,18 @@ class AffineBound:
                 second_bias,
                 quadratic_relaxation="affine",
             )
-            interval = self.product_of_source_planes(
+            zonotope = self.product_of_source_planes(
                 first_coeff,
                 first_bias,
                 second_coeff,
                 second_bias,
-                quadratic_relaxation="interval",
+                quadratic_relaxation="zonotope",
             )
-            use_affine_lower = affine.lower >= interval.lower
-            use_affine_upper = affine.upper <= interval.upper
-            return AffineBound(
-                jnp.where(
-                    use_affine_lower[..., None],
-                    affine.lower_coeff,
-                    interval.lower_coeff,
-                ),
-                jnp.where(use_affine_lower, affine.lower_bias, interval.lower_bias),
-                jnp.where(
-                    use_affine_upper[..., None],
-                    affine.upper_coeff,
-                    interval.upper_coeff,
-                ),
-                jnp.where(use_affine_upper, affine.upper_bias, interval.upper_bias),
-                self.domain_lower,
-                self.domain_upper,
-            )
-        if quadratic_relaxation not in ("affine", "interval"):
+            return _tighter_concretized_planes(affine, zonotope)
+        if quadratic_relaxation not in ("affine", "interval", "zonotope"):
             raise ValueError(
-                "quadratic_relaxation must be 'affine', 'interval', or 'best'; "
+                "quadratic_relaxation must be 'affine', 'interval', "
+                "'zonotope', or 'best'; "
                 f"got {quadratic_relaxation!r}."
             )
         first_coeff = jnp.asarray(first_coeff)
@@ -269,6 +336,48 @@ class AffineBound:
         source_lower = self.domain_lower
         source_upper = self.domain_upper
         source_center = 0.5 * (source_lower + source_upper)
+
+        if quadratic_relaxation == "zonotope":
+            # Center the box: p=p_c+a^T xi, q=q_c+c^T xi. Retain the
+            # entire first-order part and range (a^T xi)(c^T xi) jointly.
+            first_center = first_bias + jnp.sum(first_coeff * source_center, axis=-1)
+            second_center = second_bias + jnp.sum(
+                second_coeff * source_center, axis=-1
+            )
+            centered_coeff = (
+                second_center[..., None] * first_coeff
+                + first_center[..., None] * second_coeff
+            )
+            centered_bias = first_center * second_center - jnp.sum(
+                centered_coeff * source_center, axis=-1
+            )
+            if self.input_size:
+                remainder_lower, remainder_upper = _bilinear_zonotope_extrema(
+                    first_coeff,
+                    second_coeff,
+                    0.5 * (source_upper - source_lower),
+                )
+            else:
+                remainder_lower = jnp.zeros(output_shape, dtype=centered_bias.dtype)
+                remainder_upper = remainder_lower
+            joint = AffineBound(
+                centered_coeff,
+                centered_bias + remainder_lower,
+                centered_coeff,
+                centered_bias + remainder_upper,
+                source_lower,
+                source_upper,
+            )
+            # The existing interval mode ranges uncentered monomials, so its
+            # final endpoint may be tighter despite the joint remainder.
+            interval = self.product_of_source_planes(
+                first_coeff,
+                first_bias,
+                second_coeff,
+                second_bias,
+                quadratic_relaxation="interval",
+            )
+            return _tighter_concretized_planes(joint, interval)
 
         if quadratic_relaxation == "interval":
             square_at_lower = source_lower**2
@@ -428,6 +537,491 @@ class AffineBound:
             lower_bias,
             upper_coeff,
             upper_bias,
+            source_lower,
+            source_upper,
+        )
+
+    def product_of_source_plane_and_square(
+        self,
+        first_coeff: ArrayLike,
+        first_bias: ArrayLike,
+        squared_coeff: ArrayLike,
+        squared_bias: ArrayLike,
+        *,
+        cubic_relaxation: Literal[
+            "grouped_interval", "monomial_interval", "zonotope_remainder"
+        ] = "monomial_interval",
+    ) -> AffineBound:
+        """Bound one affine source plane times the square of another.
+
+        For ``f(z) = a^T z + b`` and ``g(z) = c^T z + d``, expand around
+        the source-box center ``z_c``.  With ``xi = z - z_c``, write
+
+        ``f = f_c + a^T xi`` and ``g = g_c + c^T xi``.  Then
+
+        ``f g^2 = f_c g_c^2 + (g_c^2 a + 2 f_c g_c c)^T xi + r(xi)``,
+
+        where ``r`` contains every quadratic and cubic term. All modes keep
+        the constant and linear terms exact.  ``"grouped_interval"`` applies
+        interval arithmetic to the grouped products in ``r``.
+        ``"monomial_interval"`` first aggregates the coefficient of each
+        canonical quadratic or cubic source monomial and then ranges that
+        monomial. ``"zonotope_remainder"`` optimizes the complete nonlinear
+        remainder over the two-dimensional zonotope traced by
+        ``(a^T xi, c^T xi)``. Centering keeps all relaxed terms proportional
+        to the source radii rather than to an arbitrary source origin. The
+        monomial families are aggregated with vectorized JAX operations;
+        ``"zonotope_remainder"`` additionally sorts the source generators by
+        angle and solves a fixed set of edge polynomials.
+        """
+        if cubic_relaxation not in (
+            "grouped_interval",
+            "monomial_interval",
+            "zonotope_remainder",
+        ):
+            raise ValueError(
+                "cubic_relaxation must be 'grouped_interval', "
+                "'monomial_interval', or 'zonotope_remainder'; "
+                f"got {cubic_relaxation!r}."
+            )
+
+        first_coeff = jnp.asarray(first_coeff)
+        first_bias = jnp.asarray(first_bias)
+        squared_coeff = jnp.asarray(squared_coeff)
+        squared_bias = jnp.asarray(squared_bias)
+        if first_coeff.ndim == 0 or first_coeff.shape[-1] != self.input_size:
+            raise ValueError(
+                "First affine-plane coefficient shape must end with input_size; "
+                f"expected {self.input_size}, got {first_coeff.shape}."
+            )
+        if squared_coeff.ndim == 0 or squared_coeff.shape[-1] != self.input_size:
+            raise ValueError(
+                "Squared affine-plane coefficient shape must end with input_size; "
+                f"expected {self.input_size}, got {squared_coeff.shape}."
+            )
+
+        output_shape = jnp.broadcast_shapes(
+            first_coeff.shape[:-1],
+            first_bias.shape,
+            squared_coeff.shape[:-1],
+            squared_bias.shape,
+        )
+        coeff_shape = output_shape + (self.input_size,)
+        first_coeff = jnp.broadcast_to(first_coeff, coeff_shape)
+        squared_coeff = jnp.broadcast_to(squared_coeff, coeff_shape)
+        first_bias = jnp.broadcast_to(first_bias, output_shape)
+        squared_bias = jnp.broadcast_to(squared_bias, output_shape)
+
+        source_lower = self.domain_lower
+        source_upper = self.domain_upper
+        source_center = 0.5 * (source_lower + source_upper)
+        centered_lower = source_lower - source_center
+        centered_upper = source_upper - source_center
+
+        first_center = (
+            jnp.sum(first_coeff * source_center, axis=-1) + first_bias
+        )
+        squared_center = (
+            jnp.sum(squared_coeff * source_center, axis=-1) + squared_bias
+        )
+        constant = first_center * squared_center**2
+        linear_coeff = (
+            squared_center[..., None] ** 2 * first_coeff
+            + 2.0
+            * first_center[..., None]
+            * squared_center[..., None]
+            * squared_coeff
+        )
+
+        if self.input_size == 0:
+            return AffineBound(
+                linear_coeff,
+                constant,
+                linear_coeff,
+                constant,
+                source_lower,
+                source_upper,
+            )
+
+        zero = jnp.zeros(output_shape, dtype=linear_coeff.dtype)
+        first_deviation_lower = self._minimum(
+            first_coeff, zero, centered_lower, centered_upper
+        )
+        first_deviation_upper = self._maximum(
+            first_coeff, zero, centered_lower, centered_upper
+        )
+        squared_deviation_lower = self._minimum(
+            squared_coeff, zero, centered_lower, centered_upper
+        )
+        squared_deviation_upper = self._maximum(
+            squared_coeff, zero, centered_lower, centered_upper
+        )
+
+        squared_deviation_squared_lower = jnp.where(
+            (squared_deviation_lower <= 0.0)
+            & (squared_deviation_upper >= 0.0),
+            0.0,
+            jnp.minimum(
+                squared_deviation_lower**2,
+                squared_deviation_upper**2,
+            ),
+        )
+        squared_deviation_squared_upper = jnp.maximum(
+            squared_deviation_lower**2,
+            squared_deviation_upper**2,
+        )
+
+        if cubic_relaxation == "zonotope_remainder":
+            # The complete nonlinear remainder depends only on
+            #
+            #   u = first_coeff^T xi,  v = squared_coeff^T xi
+            #
+            # through
+            #
+            #   r(u, v) = first_center v^2
+            #             + 2 squared_center u v + u v^2.
+            #
+            # The feasible (u, v) form a centrally symmetric 2D zonotope.
+            # Construct its polygonal boundary from angle-sorted generators,
+            # optimize the cubic along every edge, and include both possible
+            # interior stationary values.
+            edge_start, steps, _ = _bilinear_zonotope_edges(
+                first_coeff,
+                squared_coeff,
+                0.5 * (source_upper - source_lower),
+            )
+            u0 = edge_start[..., 0]
+            v0 = edge_start[..., 1]
+            du = steps[..., 0]
+            dv = steps[..., 1]
+            first_center_edge = first_center[..., None]
+            squared_center_edge = squared_center[..., None]
+
+            # r(t) = r0 + r1 t + r2 t^2 + r3 t^3 on each edge.
+            r0 = (
+                first_center_edge * v0**2
+                + 2.0 * squared_center_edge * u0 * v0
+                + u0 * v0**2
+            )
+            r1 = (
+                2.0 * first_center_edge * v0 * dv
+                + 2.0 * squared_center_edge * (u0 * dv + du * v0)
+                + 2.0 * u0 * v0 * dv
+                + du * v0**2
+            )
+            r2 = (
+                first_center_edge * dv**2
+                + 2.0 * squared_center_edge * du * dv
+                + u0 * dv**2
+                + 2.0 * du * v0 * dv
+            )
+            r3 = du * dv**2
+
+            derivative_a = 3.0 * r3
+            derivative_b = 2.0 * r2
+            derivative_c = r1
+            is_quadratic = derivative_a != 0.0
+            safe_a = jnp.where(is_quadratic, derivative_a, 1.0)
+            discriminant = derivative_b**2 - 4.0 * derivative_a * derivative_c
+            has_quadratic_roots = is_quadratic & (discriminant >= 0.0)
+            root_scale = jnp.sqrt(jnp.maximum(discriminant, 0.0))
+            root_minus = (-derivative_b - root_scale) / (2.0 * safe_a)
+            root_plus = (-derivative_b + root_scale) / (2.0 * safe_a)
+
+            is_linear = (~is_quadratic) & (derivative_b != 0.0)
+            safe_b = jnp.where(is_linear, derivative_b, 1.0)
+            root_linear = -derivative_c / safe_b
+            roots = jnp.stack((root_minus, root_plus, root_linear), axis=-1)
+            root_valid = jnp.stack(
+                (
+                    has_quadratic_roots,
+                    has_quadratic_roots,
+                    is_linear,
+                ),
+                axis=-1,
+            ) & (roots >= 0.0) & (roots <= 1.0)
+            roots = jnp.clip(roots, 0.0, 1.0)
+            root_values = (
+                r0[..., None]
+                + roots
+                * (
+                    r1[..., None]
+                    + roots
+                    * (r2[..., None] + roots * r3[..., None])
+                )
+            )
+            positive_infinity = jnp.asarray(jnp.inf, dtype=linear_coeff.dtype)
+            negative_infinity = -positive_infinity
+            root_minimum = jnp.min(
+                jnp.where(root_valid, root_values, positive_infinity),
+                axis=(-2, -1),
+            )
+            root_maximum = jnp.max(
+                jnp.where(root_valid, root_values, negative_infinity),
+                axis=(-2, -1),
+            )
+            endpoint_minimum = jnp.min(
+                jnp.minimum(r0, r0 + r1 + r2 + r3), axis=-1
+            )
+            endpoint_maximum = jnp.max(
+                jnp.maximum(r0, r0 + r1 + r2 + r3), axis=-1
+            )
+            boundary_minimum = jnp.minimum(endpoint_minimum, root_minimum)
+            boundary_maximum = jnp.maximum(endpoint_maximum, root_maximum)
+
+            # The origin is always feasible and stationary. The only other
+            # isolated stationary point is
+            # (u, v) = (-2 first_center, -2 squared_center).
+            stationary_u = -2.0 * first_center
+            stationary_v = -2.0 * squared_center
+            cross = (
+                du * (stationary_v[..., None] - v0)
+                - dv * (stationary_u[..., None] - u0)
+            )
+            floating_tolerance = (
+                64.0
+                * jnp.finfo(linear_coeff.dtype).eps
+                * (
+                    1.0
+                    + jnp.max(jnp.abs(steps), axis=(-2, -1)) ** 2
+                    + jnp.abs(stationary_u)
+                    + jnp.abs(stationary_v)
+                )
+            )
+            stationary_inside = jnp.all(
+                cross >= -floating_tolerance[..., None], axis=-1
+            )
+            stationary_inside &= (
+                stationary_u >= first_deviation_lower - floating_tolerance
+            ) & (
+                stationary_u <= first_deviation_upper + floating_tolerance
+            )
+            stationary_inside &= (
+                stationary_v >= squared_deviation_lower - floating_tolerance
+            ) & (
+                stationary_v <= squared_deviation_upper + floating_tolerance
+            )
+            stationary_value = (
+                first_center * stationary_v**2
+                + 2.0
+                * squared_center
+                * stationary_u
+                * stationary_v
+                + stationary_u * stationary_v**2
+            )
+            remainder_lower = jnp.minimum(boundary_minimum, 0.0)
+            remainder_upper = jnp.maximum(boundary_maximum, 0.0)
+            remainder_lower = jnp.minimum(
+                remainder_lower,
+                jnp.where(
+                    stationary_inside, stationary_value, positive_infinity
+                ),
+            )
+            remainder_upper = jnp.maximum(
+                remainder_upper,
+                jnp.where(
+                    stationary_inside, stationary_value, negative_infinity
+                ),
+            )
+        elif cubic_relaxation == "grouped_interval":
+            quadratic_square_lower, quadratic_square_upper = (
+                self._interval_product(
+                    first_center,
+                    first_center,
+                    squared_deviation_squared_lower,
+                    squared_deviation_squared_upper,
+                )
+            )
+            cross_lower, cross_upper = self._interval_product(
+                first_deviation_lower,
+                first_deviation_upper,
+                squared_deviation_lower,
+                squared_deviation_upper,
+            )
+            quadratic_cross_lower, quadratic_cross_upper = (
+                self._interval_product(
+                    2.0 * squared_center,
+                    2.0 * squared_center,
+                    cross_lower,
+                    cross_upper,
+                )
+            )
+            cubic_lower, cubic_upper = self._interval_product(
+                first_deviation_lower,
+                first_deviation_upper,
+                squared_deviation_squared_lower,
+                squared_deviation_squared_upper,
+            )
+            remainder_lower = (
+                quadratic_square_lower + quadratic_cross_lower + cubic_lower
+            )
+            remainder_upper = (
+                quadratic_square_upper + quadratic_cross_upper + cubic_upper
+            )
+        else:
+            remainder_lower = jnp.zeros(output_shape, dtype=linear_coeff.dtype)
+            remainder_upper = jnp.zeros(output_shape, dtype=linear_coeff.dtype)
+
+            def add_monomial(coefficient, monomial_lower, monomial_upper):
+                term_lower = coefficient * jnp.where(
+                    coefficient >= 0.0, monomial_lower, monomial_upper
+                )
+                term_upper = coefficient * jnp.where(
+                    coefficient >= 0.0, monomial_upper, monomial_lower
+                )
+                return term_lower, term_upper
+
+            # Build static monomial index sets once, then evaluate every term
+            # in each family with one vectorized JAX expression. This keeps the
+            # compiled graph compact compared with nested Python arithmetic.
+            source_square_lower = jnp.where(
+                (centered_lower <= 0.0) & (centered_upper >= 0.0),
+                0.0,
+                jnp.minimum(centered_lower**2, centered_upper**2),
+            )
+            source_square_upper = jnp.maximum(
+                centered_lower**2, centered_upper**2
+            )
+
+            # Quadratic monomials xi_i^2.
+            coefficient = (
+                first_center[..., None] * squared_coeff**2
+                + 2.0
+                * squared_center[..., None]
+                * first_coeff
+                * squared_coeff
+            )
+            term_lower, term_upper = add_monomial(
+                coefficient, source_square_lower, source_square_upper
+            )
+            remainder_lower += jnp.sum(term_lower, axis=-1)
+            remainder_upper += jnp.sum(term_upper, axis=-1)
+
+            # Quadratic monomials xi_i xi_j, i < j.
+            first_index, second_index = jnp.triu_indices(self.input_size, k=1)
+            product_lower, product_upper = self._interval_product(
+                centered_lower[first_index],
+                centered_upper[first_index],
+                centered_lower[second_index],
+                centered_upper[second_index],
+            )
+            coefficient = (
+                2.0
+                * first_center[..., None]
+                * squared_coeff[..., first_index]
+                * squared_coeff[..., second_index]
+                + 2.0
+                * squared_center[..., None]
+                * (
+                    first_coeff[..., first_index]
+                    * squared_coeff[..., second_index]
+                    + first_coeff[..., second_index]
+                    * squared_coeff[..., first_index]
+                )
+            )
+            term_lower, term_upper = add_monomial(
+                coefficient, product_lower, product_upper
+            )
+            remainder_lower += jnp.sum(term_lower, axis=-1)
+            remainder_upper += jnp.sum(term_upper, axis=-1)
+
+            # Cubic monomials xi_i^3.
+            coefficient = first_coeff * squared_coeff**2
+            term_lower, term_upper = add_monomial(
+                coefficient, centered_lower**3, centered_upper**3
+            )
+            remainder_lower += jnp.sum(term_lower, axis=-1)
+            remainder_upper += jnp.sum(term_upper, axis=-1)
+
+            # Cubic monomials xi_i^2 xi_j, i != j.
+            square_index = jnp.asarray(
+                [
+                    i
+                    for i in range(self.input_size)
+                    for j in range(self.input_size)
+                    if i != j
+                ],
+                dtype=jnp.int32,
+            )
+            linear_index = jnp.asarray(
+                [
+                    j
+                    for i in range(self.input_size)
+                    for j in range(self.input_size)
+                    if i != j
+                ],
+                dtype=jnp.int32,
+            )
+            monomial_lower, monomial_upper = self._interval_product(
+                source_square_lower[square_index],
+                source_square_upper[square_index],
+                centered_lower[linear_index],
+                centered_upper[linear_index],
+            )
+            coefficient = (
+                first_coeff[..., linear_index]
+                * squared_coeff[..., square_index] ** 2
+                + 2.0
+                * first_coeff[..., square_index]
+                * squared_coeff[..., square_index]
+                * squared_coeff[..., linear_index]
+            )
+            term_lower, term_upper = add_monomial(
+                coefficient, monomial_lower, monomial_upper
+            )
+            remainder_lower += jnp.sum(term_lower, axis=-1)
+            remainder_upper += jnp.sum(term_upper, axis=-1)
+
+            # Cubic monomials xi_i xi_j xi_k, i < j < k.
+            triples = [
+                (i, j, k)
+                for i in range(self.input_size)
+                for j in range(i + 1, self.input_size)
+                for k in range(j + 1, self.input_size)
+            ]
+            triple_index = tuple(
+                jnp.asarray([item[axis] for item in triples], dtype=jnp.int32)
+                for axis in range(3)
+            )
+            i, j, k = triple_index
+            pair_lower, pair_upper = self._interval_product(
+                centered_lower[i],
+                centered_upper[i],
+                centered_lower[j],
+                centered_upper[j],
+            )
+            monomial_lower, monomial_upper = self._interval_product(
+                pair_lower,
+                pair_upper,
+                centered_lower[k],
+                centered_upper[k],
+            )
+            coefficient = 2.0 * (
+                first_coeff[..., i]
+                * squared_coeff[..., j]
+                * squared_coeff[..., k]
+                + first_coeff[..., j]
+                * squared_coeff[..., i]
+                * squared_coeff[..., k]
+                + first_coeff[..., k]
+                * squared_coeff[..., i]
+                * squared_coeff[..., j]
+            )
+            term_lower, term_upper = add_monomial(
+                coefficient, monomial_lower, monomial_upper
+            )
+            remainder_lower += jnp.sum(term_lower, axis=-1)
+            remainder_upper += jnp.sum(term_upper, axis=-1)
+
+        # Convert the exact linear term from xi = z - z_c back to z.
+        linear_bias = constant - jnp.sum(
+            linear_coeff * source_center, axis=-1
+        )
+        return AffineBound(
+            linear_coeff,
+            linear_bias + remainder_lower,
+            linear_coeff,
+            linear_bias + remainder_upper,
             source_lower,
             source_upper,
         )

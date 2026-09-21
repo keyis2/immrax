@@ -10,6 +10,22 @@ interval inclusion and ``@f.defaif`` for specialized affine inclusion.  When
 ``defaif`` is absent, affine evaluation transparently expands the original
 undecorated implementation without calling ``defif`` or concretizing it.
 
+For expressions already represented as exact affine planes over a shared
+source box, :meth:`immrax.inclusion.AffineBound.product_of_source_planes`
+provides affine, interval-remainder, and joint-zonotope quadratic relaxations.
+:meth:`immrax.inclusion.AffineBound.product_of_source_plane_and_square`
+provides the corresponding centered cubic relaxations for a plane times the
+square of another plane.  These methods preserve the source coordinates and
+are intended for specialized inclusion rules; their mode strings are static
+choices made while JAX traces the caller.
+
+The generic affine multiplication implementation also retains the internal
+research switch ``immrax.inclusion.aif._MUL_RELAXATION``.  Its default
+``"baseline"`` preserves the original center-selected McCormick rule;
+``"source_optimized"`` enables the continuous-parameter McCormick experiment.
+Set this switch before tracing or JIT compilation, because changing it does
+not invalidate an already compiled JAX executable.
+
 .. automodule:: immrax.inclusion
    :members:
    :undoc-members:

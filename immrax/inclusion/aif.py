@@ -516,10 +516,11 @@ def _scale(x: AffineBound, c) -> AffineBound:
     )
 
 
-# Experimental tracing-time choice for affine-by-affine multiplication.
+# Tracing-time choice for affine-by-affine multiplication.
 # Set it before tracing or JIT-compiling an ``affif`` function. Changing this
 # value does not invalidate already compiled JAX executables.
-_MUL_RELAXATION = "baseline"
+_MUL_RELAXATION = "source_optimized"
+# _MUL_RELAXATION = "baseline"
 
 
 def _mul_mccormick_baseline(
@@ -701,8 +702,8 @@ def _mul_mccormick_source_optimized(
     ``r = 0`` and ``r = 1`` are always included, the concretized result
     dominates both vertex McCormick planes.
 
-    The generic ``_mul`` path uses it only when ``_MUL_RELAXATION`` is set to
-    ``"source_optimized"`` before JAX traces the calling function.
+    This is the default generic ``_mul`` path. Set ``_MUL_RELAXATION`` to
+    ``"baseline"`` before tracing to recover the center-selected rule.
     """
     lower_coeff, lower_bias = _select_mccormick_source_side(
         x, y, like, lower=True

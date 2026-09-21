@@ -13,6 +13,9 @@ undecorated implementation without calling ``defif`` or concretizing it.
 For expressions already represented as exact affine planes over a shared
 source box, :meth:`immrax.inclusion.AffineBound.product_of_source_planes`
 provides affine, interval-remainder, and joint-zonotope quadratic relaxations.
+Its adaptive mode searches nine zonotope slopes and retains the interval
+remainder as a fallback; ``best`` selects complete endpoints between the
+adaptive and affine relaxations.
 :meth:`immrax.inclusion.AffineBound.product_of_source_plane_and_square`
 provides the corresponding centered cubic relaxations for a plane times the
 square of another plane.  These methods preserve the source coordinates and
@@ -21,8 +24,8 @@ choices made while JAX traces the caller.
 
 The generic affine multiplication implementation also retains the internal
 research switch ``immrax.inclusion.aif._MUL_RELAXATION``.  Its default
-``"baseline"`` preserves the original center-selected McCormick rule;
-``"source_optimized"`` enables the continuous-parameter McCormick experiment.
+``"source_optimized"`` uses the continuous-parameter McCormick rule;
+``"baseline"`` restores the original center-selected rule.
 Set this switch before tracing or JIT compilation, because changing it does
 not invalidate an already compiled JAX executable.
 

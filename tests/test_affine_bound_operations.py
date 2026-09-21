@@ -164,6 +164,17 @@ def test_product_of_source_planes_is_jittable_and_sound_for_batched_planes():
             )
         )
     )(first_coeff, first_bias, second_coeff, second_bias)
+    adaptive_product = jax.jit(
+        lambda first_coeff, first_bias, second_coeff, second_bias: (
+            template.product_of_source_planes(
+                first_coeff,
+                first_bias,
+                second_coeff,
+                second_bias,
+                quadratic_relaxation="adaptive",
+            )
+        )
+    )(first_coeff, first_bias, second_coeff, second_bias)
     best_product = jax.jit(
         lambda first_coeff, first_bias, second_coeff, second_bias: (
             template.product_of_source_planes(
@@ -202,6 +213,12 @@ def test_product_of_source_planes_is_jittable_and_sound_for_batched_planes():
     zonotope_upper = (
         points @ zonotope_product.upper_coeff.T + zonotope_product.upper_bias
     )
+    adaptive_lower = (
+        points @ adaptive_product.lower_coeff.T + adaptive_product.lower_bias
+    )
+    adaptive_upper = (
+        points @ adaptive_product.upper_coeff.T + adaptive_product.upper_bias
+    )
 
     assert product.shape == (2,)
     assert broadcast_product.shape == (2,)
@@ -211,14 +228,20 @@ def test_product_of_source_planes_is_jittable_and_sound_for_batched_planes():
     assert jnp.all(interval_upper >= exact - 2e-6)
     assert jnp.all(zonotope_lower <= exact + 2e-6)
     assert jnp.all(zonotope_upper >= exact - 2e-6)
+    assert jnp.all(adaptive_lower <= exact + 2e-6)
+    assert jnp.all(adaptive_upper >= exact - 2e-6)
     assert jnp.all(best_lower <= exact + 2e-6)
     assert jnp.all(best_upper >= exact - 2e-6)
     assert jnp.all(best_product.width <= product.width + 2e-6)
     assert jnp.all(best_product.width <= interval_product.width + 2e-6)
     assert jnp.all(zonotope_product.lower >= interval_product.lower - 2e-6)
     assert jnp.all(zonotope_product.upper <= interval_product.upper + 2e-6)
+    assert jnp.all(adaptive_product.lower >= interval_product.lower - 2e-6)
+    assert jnp.all(adaptive_product.upper <= interval_product.upper + 2e-6)
     assert jnp.all(best_product.lower >= zonotope_product.lower - 2e-6)
     assert jnp.all(best_product.upper <= zonotope_product.upper + 2e-6)
+    assert jnp.all(best_product.lower >= adaptive_product.lower - 2e-6)
+    assert jnp.all(best_product.upper <= adaptive_product.upper + 2e-6)
 
 
 def test_source_plane_times_square_interval_cubic_is_jittable_and_sound():

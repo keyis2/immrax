@@ -1,4 +1,4 @@
-"""Focused checks for the unused source-optimized multiplication rule."""
+"""Focused checks for source-optimized affine multiplication."""
 
 import importlib
 
@@ -38,6 +38,10 @@ def _nonthin_bound(exact_coeff, exact_bias, lower_shift, upper_shift):
         domain_lower,
         domain_upper,
     )
+
+
+def test_source_optimized_multiplication_is_default():
+    assert aif._MUL_RELAXATION == "source_optimized"
 
 
 def test_multiplication_switch_preserves_baseline_and_selects_experiment(monkeypatch):

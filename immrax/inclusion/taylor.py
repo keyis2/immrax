@@ -1,4 +1,4 @@
-"""Experimental degree-2 Taylor models over one shared source box.
+"""Experimental degree-2 Taylor models over one normalized source box.
 
 This module is intentionally small and incomplete.  It supports the primitive
 surface needed by the fixed-layout MuJoDiCo hinge experiment, not a general
@@ -24,23 +24,28 @@ expansion about ``c`` and an interval Lagrange remainder.  Arithmetic uses
 ordinary JAX floating point and has not received a directed-rounding audit.
 
 Current deliberate limitations include a fixed normalized box, dense ``Q``,
-termwise polynomial ranges, sign-certified max/ReLU branches only, division
-only when the denominator range excludes zero, eager-only branch decisions,
-one flat transformed output, and an incomplete primitive surface.  Custom
-primitive rules live in a mutable experimental registry and must be installed
-explicitly by a caller such as the MuJoDiCo diagnostic.
+termwise polynomial ranges, interval-only fallbacks at singular-but-defined
+smooth domains, top enclosures outside supported real domains, one flat
+transformed output, and an incomplete primitive surface.  Crossing ReLUs keep
+the existing sources through a linear relaxation; arbitrary uncertain
+selection uses an interval hull.  Custom primitive rules live in a mutable
+experimental registry and may be registered by the modules that own those
+primitives.  All nonconstant Taylor operands in one expression
+must descend from the same normalized seed.  The representation records only
+the common source dimension: source-space identity and merging independently
+seeded source spaces are unsupported.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from functools import wraps
+import operator
 from typing import Any
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax import lax
 from jax._src import ad_util
 from jax._src.core import Literal
@@ -112,16 +117,15 @@ def _as_interval(value) -> Interval:
 
 
 def _ireciprocal(x: Interval) -> Interval:
-    try:
-        excludes_zero = bool(np.all(np.asarray((x.lower > 0) | (x.upper < 0))))
-    except (TypeError, jax.errors.TracerArrayConversionError):
-        excludes_zero = False
-    if not excludes_zero:
-        raise NotImplementedError(
-            "experimental interval reciprocal denominator contains zero"
-        )
-    first, second = 1 / x.lower, 1 / x.upper
-    return Interval(jnp.minimum(first, second), jnp.maximum(first, second))
+    excludes_zero = (x.lower > 0) | (x.upper < 0)
+    safe_lower = jnp.where(excludes_zero, x.lower, 1)
+    safe_upper = jnp.where(excludes_zero, x.upper, 1)
+    first, second = 1 / safe_lower, 1 / safe_upper
+    infinity = jnp.full_like(first, jnp.inf)
+    return Interval(
+        jnp.where(excludes_zero, jnp.minimum(first, second), -infinity),
+        jnp.where(excludes_zero, jnp.maximum(first, second), infinity),
+    )
 
 
 @register_pytree_node_class
@@ -129,8 +133,10 @@ class TaylorModel:
     """Dense degree-2 polynomial plus a source-independent interval remainder.
 
     Coefficient arrays have shapes ``value_shape``, ``value_shape + (n,)``,
-    and ``value_shape + (n, n)``.  The remainder has ``value_shape``.  Every
-    model participating in one expression must use the same source domain.
+    and ``value_shape + (n, n)``.  The remainder has ``value_shape`` and the
+    implicit source domain is always ``[-1, 1]^n``.  Every nonconstant model
+    participating in one expression must descend from the same normalized
+    seed; source identity is not tracked or merged by this experimental type.
     """
 
     def __init__(
@@ -139,23 +145,20 @@ class TaylorModel:
         linear,
         quadratic,
         remainder: Interval,
-        domain_lower,
-        domain_upper,
     ):
         self.constant = jnp.asarray(constant)
         self.linear = jnp.asarray(linear)
         self.quadratic = jnp.asarray(quadratic)
         self.remainder = remainder
-        self.domain_lower = jnp.asarray(domain_lower).reshape(-1)
-        self.domain_upper = jnp.asarray(domain_upper).reshape(-1)
-        n = self.domain_lower.size
-        if self.domain_upper.shape != self.domain_lower.shape:
-            raise ValueError("Taylor-model source bounds must have equal shapes.")
-        if self.linear.shape != self.constant.shape + (n,):
+        if (
+            self.linear.ndim != self.constant.ndim + 1
+            or self.linear.shape[:-1] != self.constant.shape
+        ):
             raise ValueError(
                 "linear shape must be value shape + (source_size,); got "
-                f"{self.linear.shape} for {self.constant.shape} and n={n}"
+                f"{self.linear.shape} for value shape {self.constant.shape}"
             )
+        n = self.linear.shape[-1]
         if self.quadratic.shape != self.constant.shape + (n, n):
             raise ValueError(
                 "quadratic shape must be value shape + (source_size, source_size); "
@@ -171,8 +174,6 @@ class TaylorModel:
                 self.linear,
                 self.quadratic,
                 self.remainder,
-                self.domain_lower,
-                self.domain_upper,
             ),
             None,
         )
@@ -195,7 +196,7 @@ class TaylorModel:
 
     @property
     def source_size(self):
-        return self.domain_lower.size
+        return self.linear.shape[-1]
 
     @property
     def dtype(self):
@@ -217,8 +218,6 @@ class TaylorModel:
                 self.remainder.lower.reshape(*shape),
                 self.remainder.upper.reshape(*shape),
             ),
-            self.domain_lower,
-            self.domain_upper,
         )
 
     def transpose(self, *axes):
@@ -234,8 +233,6 @@ class TaylorModel:
             self.linear[index],
             self.quadratic[index],
             self.remainder[index],
-            self.domain_lower,
-            self.domain_upper,
         )
 
     def __add__(self, other):
@@ -266,13 +263,15 @@ class TaylorModel:
         return _div(other, self)
 
 
-def constant_taylor_model(value, domain_lower, domain_upper) -> TaylorModel:
-    """Lift a point value into an existing normalized source domain."""
+def constant_taylor_model(value, source_size) -> TaylorModel:
+    """Lift a point value into a normalized source space of static size."""
 
     value = jnp.asarray(value)
-    domain_lower = jnp.asarray(domain_lower).reshape(-1)
-    domain_upper = jnp.asarray(domain_upper).reshape(-1)
-    n = domain_lower.size
+    if isinstance(source_size, TaylorModel):
+        source_size = source_size.source_size
+    n = operator.index(source_size)
+    if n < 0:
+        raise ValueError("Taylor-model source size must be nonnegative.")
     dtype = jnp.result_type(value, float)
     value = value.astype(dtype)
     return TaylorModel(
@@ -280,47 +279,265 @@ def constant_taylor_model(value, domain_lower, domain_upper) -> TaylorModel:
         jnp.zeros(value.shape + (n,), dtype=dtype),
         jnp.zeros(value.shape + (n, n), dtype=dtype),
         _zero_interval(value),
-        domain_lower,
-        domain_upper,
     )
 
 
+def interval_taylor_model(lower, upper, like: TaylorModel) -> TaylorModel:
+    """Represent an interval with zero retained polynomial in ``like``'s space."""
+
+    return _interval_only(lower, upper, like)
+
+
+def append_taylor_sources(x: TaylorModel, count: int) -> TaylorModel:
+    """Append normalized sources with exactly zero influence.
+
+    The existing sources remain the leading coordinates and the appended
+    coordinates are ordered last.  The represented pointwise fibers are
+    unchanged for every value of the new sources in ``[-1, 1]``.
+    """
+
+    count = operator.index(count)
+    if count < 0:
+        raise ValueError("appended Taylor source count must be nonnegative")
+    padding = ((0, 0),) * x.ndim
+    return TaylorModel(
+        x.constant,
+        jnp.pad(x.linear, padding + ((0, count),)),
+        jnp.pad(x.quadratic, padding + ((0, count), (0, count))),
+        x.remainder,
+    )
+
+
+def lift_taylor_remainder_to_sources(x: TaylorModel) -> TaylorModel:
+    """Replace a Cartesian interval remainder by independent unit sources.
+
+    One source is appended per flattened output component in row-major order.
+    For component ``i``, source ``x.source_size + i`` carries the corresponding
+    remainder radius.  The returned model has zero interval remainder and
+    represents exactly the complete Cartesian fiber of ``x``.
+    """
+
+    component_count = x.size
+    lifted = append_taylor_sources(x, component_count)
+    midpoint = 0.5 * (x.remainder.lower + x.remainder.upper)
+    radius = 0.5 * (x.remainder.upper - x.remainder.lower)
+    flat_linear = lifted.linear.reshape((component_count, lifted.source_size))
+    component_indices = jnp.arange(component_count)
+    flat_linear = flat_linear.at[
+        component_indices, x.source_size + component_indices
+    ].set(radius.reshape(-1))
+    constant = x.constant + midpoint
+    return TaylorModel(
+        constant,
+        flat_linear.reshape(x.shape + (lifted.source_size,)),
+        lifted.quadratic,
+        _zero_interval(constant),
+    )
+
+
+def marginalize_taylor_sources(
+    x: TaylorModel, keep_source_count: int
+) -> TaylorModel:
+    """Eliminate trailing sources into the interval remainder.
+
+    The leading ``keep_source_count`` sources remain in the retained
+    polynomial.  Every linear or quadratic monomial involving an eliminated
+    source is bounded termwise on the normalized box and added to the existing
+    remainder.  Diagonal eliminated squares use ``eta**2 in [0, 1]``; mixed
+    monomials use ``[-1, 1]``.
+    """
+
+    keep_source_count = operator.index(keep_source_count)
+    if not 0 <= keep_source_count <= x.source_size:
+        raise ValueError(
+            "kept Taylor source count must lie in [0, source_size]; got "
+            f"{keep_source_count} for {x.source_size}"
+        )
+    symmetric = 0.5 * (x.quadratic + jnp.swapaxes(x.quadratic, -1, -2))
+    eliminated_linear_radius = jnp.sum(
+        jnp.abs(x.linear[..., keep_source_count:]), axis=-1
+    )
+    mixed_radius = jnp.sum(
+        jnp.abs(symmetric[..., :keep_source_count, keep_source_count:]),
+        axis=(-2, -1),
+    )
+    eliminated_quadratic = symmetric[
+        ..., keep_source_count:, keep_source_count:
+    ]
+    diagonal = 0.5 * jnp.diagonal(
+        eliminated_quadratic, axis1=-2, axis2=-1
+    )
+    diagonal_lower = jnp.sum(jnp.minimum(diagonal, 0), axis=-1)
+    diagonal_upper = jnp.sum(jnp.maximum(diagonal, 0), axis=-1)
+    eliminated_count = x.source_size - keep_source_count
+    upper_mask = jnp.triu(
+        jnp.ones((eliminated_count, eliminated_count), dtype=bool), k=1
+    )
+    off_diagonal_radius = jnp.sum(
+        jnp.where(upper_mask, jnp.abs(eliminated_quadratic), 0),
+        axis=(-2, -1),
+    )
+    symmetric_radius = (
+        eliminated_linear_radius + mixed_radius + off_diagonal_radius
+    )
+    return TaylorModel(
+        x.constant,
+        x.linear[..., :keep_source_count],
+        x.quadratic[..., :keep_source_count, :keep_source_count],
+        Interval(
+            x.remainder.lower + diagonal_lower - symmetric_radius,
+            x.remainder.upper + diagonal_upper + symmetric_radius,
+        ),
+    )
+
+
+def inflate_taylor_remainder(
+    x: TaylorModel, relative=0.0, absolute=1e-14
+) -> TaylorModel:
+    """Inflate only the interval remainder while preserving its midpoint."""
+
+    midpoint = 0.5 * (x.remainder.lower + x.remainder.upper)
+    radius = 0.5 * (x.remainder.upper - x.remainder.lower)
+    new_radius = (1.0 + jnp.asarray(relative)) * radius + jnp.asarray(absolute)
+    return TaylorModel(
+        x.constant,
+        x.linear,
+        x.quadratic,
+        Interval(midpoint - new_radius, midpoint + new_radius),
+    )
+
+
+def select_taylor_model(mask, on_true: TaylorModel, on_false: TaylorModel):
+    """Select packed Taylor components with a point-valued JAX mask."""
+
+    return _where_model(mask, on_true, on_false)
+
+
+def taylor_hull(first: TaylorModel, second: TaylorModel) -> TaylorModel:
+    """Return a pointwise-sound tube hull over common normalized sources.
+
+    The first retained polynomial is the common polynomial.  The second
+    polynomial's difference from it is ranged termwise and combined with the
+    second remainder.  Taking the interval union with the first remainder
+    contains both input fibers at every shared source without a sampled or
+    width-based polynomial choice.
+    """
+
+    _assert_compatible(first, second)
+    shape = jnp.broadcast_shapes(first.shape, second.shape)
+    first = _broadcast_model(first, shape)
+    second = _broadcast_model(second, shape)
+    difference = TaylorModel(
+        second.constant - first.constant,
+        second.linear - first.linear,
+        second.quadratic - first.quadratic,
+        _zero_interval(first.constant),
+    )
+    difference_range = polynomial_range(difference)
+    return TaylorModel(
+        first.constant,
+        first.linear,
+        first.quadratic,
+        Interval(
+            jnp.minimum(
+                first.remainder.lower,
+                difference_range.lower + second.remainder.lower,
+            ),
+            jnp.maximum(
+                first.remainder.upper,
+                difference_range.upper + second.remainder.upper,
+            ),
+        ),
+    )
+
+
+def taylor_endpoint_models(x: TaylorModel) -> tuple[TaylorModel, TaylorModel]:
+    """Return exact lower and upper endpoint polynomials of a Taylor tube."""
+
+    zero = _zero_interval(x.constant)
+    return (
+        TaylorModel(
+            x.constant + x.remainder.lower,
+            x.linear,
+            x.quadratic,
+            zero,
+        ),
+        TaylorModel(
+            x.constant + x.remainder.upper,
+            x.linear,
+            x.quadratic,
+            zero,
+        ),
+    )
+
+
+def taylor_inclusion_margins(
+    outer: TaylorModel, inner: TaylorModel
+) -> tuple[jax.Array, jax.Array]:
+    """Bound pointwise lower and upper margins for ``inner in outer``.
+
+    The returned arrays bound the infima of ``inner_lower - outer_lower`` and
+    ``outer_upper - inner_upper`` over the common normalized source box.
+    Positive values in every component certify strict pointwise containment.
+    """
+
+    _assert_compatible(outer, inner)
+    shape = jnp.broadcast_shapes(outer.shape, inner.shape)
+    outer = _broadcast_model(outer, shape)
+    inner = _broadcast_model(inner, shape)
+    polynomial_difference = TaylorModel(
+        inner.constant - outer.constant,
+        inner.linear - outer.linear,
+        inner.quadratic - outer.quadratic,
+        _zero_interval(outer.constant),
+    )
+    lower_margin = (
+        polynomial_range(polynomial_difference).lower
+        + inner.remainder.lower
+        - outer.remainder.lower
+    )
+    upper_margin = (
+        polynomial_range(-polynomial_difference).lower
+        + outer.remainder.upper
+        - inner.remainder.upper
+    )
+    return lower_margin, upper_margin
+
+
 def normalized_taylor_seed(lower, upper) -> TaylorModel:
-    """Represent one physical box using shared normalized sources."""
+    """Normalize one physical box; poison numerically invalid endpoints."""
 
     lower, upper = jnp.asarray(lower), jnp.asarray(upper)
     if lower.shape != upper.shape:
         raise ValueError("Seed endpoints must have equal shapes.")
+    if lower.ndim != 1 or lower.size == 0:
+        raise ValueError(
+            "The experimental seed requires one nonempty vector input."
+        )
+    numerically_valid = jnp.all(jnp.isfinite(lower) & jnp.isfinite(upper))
+    numerically_valid &= jnp.all(lower <= upper)
     center = (lower + upper) / 2
     radius = (upper - lower) / 2
     n = center.size
-    if center.ndim != 1:
-        raise ValueError("The experimental seed currently requires one vector input.")
     dtype = jnp.result_type(center, float)
+    poison = jnp.asarray(jnp.nan, dtype=dtype)
+    center = jnp.where(numerically_valid, center, poison)
+    linear = jnp.where(
+        numerically_valid,
+        jnp.diag(radius.astype(dtype)),
+        poison,
+    )
     return TaylorModel(
         center.astype(dtype),
-        jnp.diag(radius.astype(dtype)),
+        linear,
         jnp.zeros((n, n, n), dtype=dtype),
         _zero_interval(center.astype(dtype)),
-        -jnp.ones((n,), dtype=dtype),
-        jnp.ones((n,), dtype=dtype),
     )
 
 
 def _assert_compatible(x: TaylorModel, y: TaylorModel) -> None:
     if x.source_size != y.source_size:
         raise ValueError("Taylor models have different source dimensions.")
-    try:
-        compatible = np.array_equal(
-            np.asarray(x.domain_lower), np.asarray(y.domain_lower)
-        )
-        compatible &= np.array_equal(
-            np.asarray(x.domain_upper), np.asarray(y.domain_upper)
-        )
-    except (TypeError, jax.errors.TracerArrayConversionError):
-        compatible = True
-    if not compatible:
-        raise ValueError("Taylor models have incompatible source domains.")
 
 
 def _template(*values) -> TaylorModel:
@@ -336,14 +553,14 @@ def _promote(value, like: TaylorModel) -> TaylorModel:
         return value
     if isinstance(value, Interval):
         center = (value.lower + value.upper) / 2
-        promoted = constant_taylor_model(center, like.domain_lower, like.domain_upper)
+        promoted = constant_taylor_model(center, like)
         promoted.remainder = Interval(value.lower - center, value.upper - center)
         return promoted
-    return constant_taylor_model(value, like.domain_lower, like.domain_upper)
+    return constant_taylor_model(value, like)
 
 
-def _new(c, a, q, r, like: TaylorModel) -> TaylorModel:
-    return TaylorModel(c, a, q, r, like.domain_lower, like.domain_upper)
+def _new(c, a, q, r) -> TaylorModel:
+    return TaylorModel(c, a, q, r)
 
 
 def _broadcast_model(x: TaylorModel, shape) -> TaylorModel:
@@ -356,33 +573,50 @@ def _broadcast_model(x: TaylorModel, shape) -> TaylorModel:
             jnp.broadcast_to(x.remainder.lower, shape),
             jnp.broadcast_to(x.remainder.upper, shape),
         ),
-        x,
     )
+
+
+def _interval_only(lower, upper, like: TaylorModel) -> TaylorModel:
+    """Represent a value only by a source-independent interval remainder."""
+
+    lower, upper = jnp.asarray(lower), jnp.asarray(upper)
+    shape = jnp.broadcast_shapes(like.shape, lower.shape, upper.shape)
+    like = _broadcast_model(like, shape)
+    return _new(
+        jnp.zeros_like(like.constant),
+        jnp.zeros_like(like.linear),
+        jnp.zeros_like(like.quadratic),
+        Interval(jnp.broadcast_to(lower, shape), jnp.broadcast_to(upper, shape)),
+    )
+
+
+def _top_like(like: TaylorModel) -> TaylorModel:
+    infinity = jnp.full_like(like.constant, jnp.inf)
+    return _interval_only(-infinity, infinity, like)
 
 
 def _component_ranges(x: TaylorModel) -> tuple[Interval, Interval]:
-    """Return termwise ranges of the linear and quadratic components."""
+    """Return termwise ranges over the implicit normalized unit source box."""
 
-    dl, du = x.domain_lower, x.domain_upper
-    a_pos, a_neg = jnp.maximum(x.linear, 0), jnp.minimum(x.linear, 0)
-    linear = Interval(
-        jnp.sum(a_pos * dl + a_neg * du, axis=-1),
-        jnp.sum(a_pos * du + a_neg * dl, axis=-1),
+    linear_radius = jnp.sum(jnp.abs(x.linear), axis=-1)
+    linear = Interval(-linear_radius, linear_radius)
+
+    diagonal = 0.5 * jnp.diagonal(x.quadratic, axis1=-2, axis2=-1)
+    diagonal_lower = jnp.sum(jnp.minimum(diagonal, 0), axis=-1)
+    diagonal_upper = jnp.sum(jnp.maximum(diagonal, 0), axis=-1)
+
+    symmetric = 0.5 * (x.quadratic + jnp.swapaxes(x.quadratic, -1, -2))
+    upper_mask = jnp.triu(
+        jnp.ones((x.source_size, x.source_size), dtype=bool), k=1
     )
-    qlower = jnp.zeros_like(x.constant)
-    qupper = jnp.zeros_like(x.constant)
-    for i in range(x.source_size):
-        square = _isquare(Interval(dl[i], du[i]))
-        term = _iscale(square, 0.5 * x.quadratic[..., i, i])
-        qlower, qupper = qlower + term.lower, qupper + term.upper
-        for j in range(i + 1, x.source_size):
-            monomial = _imul(Interval(dl[i], du[i]), Interval(dl[j], du[j]))
-            # Q is symmetric, so the two half-weighted off-diagonal entries
-            # combine into this one coefficient.
-            coeff = 0.5 * (x.quadratic[..., i, j] + x.quadratic[..., j, i])
-            term = _iscale(monomial, coeff)
-            qlower, qupper = qlower + term.lower, qupper + term.upper
-    return linear, Interval(qlower, qupper)
+    off_diagonal_radius = jnp.sum(
+        jnp.where(upper_mask, jnp.abs(symmetric), 0), axis=(-2, -1)
+    )
+    quadratic = Interval(
+        diagonal_lower - off_diagonal_radius,
+        diagonal_upper + off_diagonal_radius,
+    )
+    return linear, quadratic
 
 
 def polynomial_range(x: TaylorModel) -> Interval:
@@ -413,8 +647,8 @@ def taylor_to_affine(x: TaylorModel) -> AffineBound:
         x.constant + discarded.lower,
         x.linear,
         x.constant + discarded.upper,
-        x.domain_lower,
-        x.domain_upper,
+        -jnp.ones((x.source_size,), dtype=x.dtype),
+        jnp.ones((x.source_size,), dtype=x.dtype),
     )
 
 
@@ -443,7 +677,6 @@ def _add(x, y):
         x.linear + y.linear,
         x.quadratic + y.quadratic,
         _iadd(x.remainder, y.remainder),
-        like,
     )
 
 
@@ -454,11 +687,26 @@ def _neg(x):
         # JAX 0.8 Jaxpr literals can be ``TypedNdArray`` instances, which are
         # accepted by primitives but do not implement Python's unary ``-``.
         return lax.neg_p.bind(x)
-    return _new(-x.constant, -x.linear, -x.quadratic, _ineg(x.remainder), x)
+    return _new(-x.constant, -x.linear, -x.quadratic, _ineg(x.remainder))
 
 
 def _sub(x, y):
     return _add(x, _neg(y))
+
+
+def _scale_model(x: TaylorModel, scale) -> TaylorModel:
+    """Scale one model exactly by a raw point scalar or array."""
+
+    scale = jnp.asarray(scale)
+    shape = jnp.broadcast_shapes(x.shape, scale.shape)
+    x = _broadcast_model(x, shape)
+    scale = jnp.broadcast_to(scale, shape)
+    return _new(
+        x.constant * scale,
+        x.linear * scale[..., None],
+        x.quadratic * scale[..., None, None],
+        _iscale(x.remainder, scale),
+    )
 
 
 def _mul(x, y):
@@ -466,6 +714,10 @@ def _mul(x, y):
         if isinstance(x, Interval) or isinstance(y, Interval):
             return _imul(_as_interval(x), _as_interval(y))
         return lax.mul_p.bind(x, y)
+    if isinstance(x, TaylorModel) and not isinstance(y, (TaylorModel, Interval)):
+        return _scale_model(x, y)
+    if isinstance(y, TaylorModel) and not isinstance(x, (TaylorModel, Interval)):
+        return _scale_model(y, x)
     like = _template(x, y)
     x, y = _promote(x, like), _promote(y, like)
     shape = jnp.broadcast_shapes(x.shape, y.shape)
@@ -499,118 +751,54 @@ def _mul(x, y):
             _iadd(_imul(py, x.remainder), _imul(x.remainder, y.remainder)),
         ),
     )
-    return _new(c, a, q, remainder, like)
+    return _new(c, a, q, remainder)
 
 
-def _is_point_model(x: TaylorModel) -> bool:
-    try:
-        return bool(
-            np.all(np.asarray(x.linear) == 0)
-            and np.all(np.asarray(x.quadratic) == 0)
-            and np.all(np.asarray(x.remainder.lower) == 0)
-            and np.all(np.asarray(x.remainder.upper) == 0)
-        )
-    except (TypeError, jax.errors.TracerArrayConversionError):
-        return False
+def _square(x: TaylorModel) -> TaylorModel:
+    """Square one model with dependency-aware repeated-interval terms."""
+
+    c = x.constant**2
+    a = 2 * x.linear * x.constant[..., None]
+    q = (
+        2 * x.quadratic * x.constant[..., None, None]
+        + 2 * x.linear[..., :, None] * x.linear[..., None, :]
+    )
+
+    # For P = c + l + q, the discarded polynomial is 2*l*q + q**2.
+    # The complete repeated-operand remainder is 2*P*R + R**2.  Squares use
+    # their dependent interval range rather than an independent rectangle
+    # product of an interval with itself.
+    linear, quadratic = _component_ranges(x)
+    overflow = _iadd(
+        _iscale(_imul(linear, quadratic), 2),
+        _isquare(quadratic),
+    )
+    polynomial = polynomial_range(x)
+    remainder = _iadd(
+        overflow,
+        _iadd(
+            _iscale(_imul(polynomial, x.remainder), 2),
+            _isquare(x.remainder),
+        ),
+    )
+    return _new(c, a, q, remainder)
 
 
 def _div(x, y):
     if isinstance(y, TaylorModel):
-        if _is_point_model(y):
-            y = y.constant
-        else:
-            return _mul(x, _unary_second_order(y, "reciprocal"))
+        return _mul(x, _unary_second_order(y, "reciprocal"))
     if isinstance(x, TaylorModel):
-        y = jnp.asarray(y)
-        return _mul(x, jnp.reciprocal(y))
+        return _scale_model(x, jnp.reciprocal(jnp.asarray(y)))
     if isinstance(x, Interval) or isinstance(y, Interval):
         return _imul(_as_interval(x), _ireciprocal(_as_interval(y)))
     return lax.div_p.bind(x, y)
 
 
-def _unary_second_order(x: TaylorModel, function: str, exponent=None) -> TaylorModel:
-    """Centered order-2 unary rule with an interval Lagrange remainder.
+def _second_order_candidate(
+    x: TaylorModel, f0, f1, f2, third: Interval
+) -> TaylorModel:
+    """Apply the centered degree-2 formula for precomputed safe derivatives."""
 
-    For ``x = c + l + q + r``, retain
-
-    ``f(c) + f'(c) * (l + q) + 0.5 * f''(c) * l**2``.
-
-    The terms involving ``r``, ``l*q``, ``q**2``, and the third-order
-    Lagrange term are enclosed in the returned interval remainder.
-    """
-
-    c = x.constant
-    input_bounds = taylor_range(x)
-    # The Lagrange point lies on the segment between the expansion point c
-    # and the represented value. Include c explicitly even for a user-created
-    # remainder interval that does not contain zero.
-    derivative_lower = jnp.minimum(input_bounds.lower, c)
-    derivative_upper = jnp.maximum(input_bounds.upper, c)
-    if function == "sin":
-        f0, f1, f2 = jnp.sin(c), jnp.cos(c), -jnp.sin(c)
-        third = Interval(-jnp.ones_like(c), jnp.ones_like(c))
-    elif function == "cos":
-        f0, f1, f2 = jnp.cos(c), -jnp.sin(c), -jnp.cos(c)
-        third = Interval(-jnp.ones_like(c), jnp.ones_like(c))
-    elif function == "sqrt":
-        try:
-            positive = bool(np.all(np.asarray(derivative_lower) > 0))
-        except (TypeError, jax.errors.TracerArrayConversionError):
-            positive = False
-        if not positive:
-            raise NotImplementedError(
-                "experimental Taylor sqrt requires a strictly positive range"
-            )
-        root = jnp.sqrt(c)
-        f0, f1, f2 = root, 0.5 / root, -0.25 / (c * root)
-        third = Interval(
-            3 / (8 * derivative_upper**2.5),
-            3 / (8 * derivative_lower**2.5),
-        )
-    elif function == "power":
-        p = jnp.asarray(exponent)
-        try:
-            valid = p.ndim == 0 and bool(np.all(np.asarray(derivative_lower) > 0))
-        except (TypeError, jax.errors.TracerArrayConversionError):
-            valid = False
-        if not valid:
-            raise NotImplementedError(
-                "experimental Taylor pow requires a point scalar exponent and "
-                "a strictly positive base range"
-            )
-        f0 = c**p
-        f1 = p * c ** (p - 1)
-        f2 = p * (p - 1) * c ** (p - 2)
-        third_lower_value = p * (p - 1) * (p - 2) * derivative_lower ** (p - 3)
-        third_upper_value = p * (p - 1) * (p - 2) * derivative_upper ** (p - 3)
-        third = Interval(
-            jnp.minimum(third_lower_value, third_upper_value),
-            jnp.maximum(third_lower_value, third_upper_value),
-        )
-    elif function == "reciprocal":
-        try:
-            excludes_zero = bool(
-                np.all(np.asarray((derivative_lower > 0) | (derivative_upper < 0)))
-            )
-        except (TypeError, jax.errors.TracerArrayConversionError):
-            excludes_zero = False
-        if not excludes_zero:
-            raise NotImplementedError(
-                "experimental Taylor reciprocal denominator range contains zero: "
-                f"lower={np.asarray(derivative_lower)}, "
-                f"upper={np.asarray(derivative_upper)}"
-            )
-        f0 = 1 / c
-        f1 = -1 / c**2
-        f2 = 2 / c**3
-        third_at_lower = -6 / derivative_lower**4
-        third_at_upper = -6 / derivative_upper**4
-        third = Interval(
-            jnp.minimum(third_at_lower, third_at_upper),
-            jnp.maximum(third_at_lower, third_at_upper),
-        )
-    else:  # pragma: no cover - private caller fixes the choices
-        raise ValueError(function)
     a = f1[..., None] * x.linear
     q = (
         f1[..., None, None] * x.quadratic
@@ -629,7 +817,141 @@ def _unary_second_order(x: TaylorModel, function: str, exponent=None) -> TaylorM
         _iscale(x.remainder, f1),
         _iadd(_iscale(second_order_tail, 0.5 * f2), lagrange),
     )
-    return _new(f0, a, q, remainder, x)
+    return _new(f0, a, q, remainder)
+
+
+def _unary_second_order(x: TaylorModel, function: str, exponent=None) -> TaylorModel:
+    """Centered order-2 unary rule with masked finite fallbacks or top."""
+
+    c = x.constant
+    input_bounds = taylor_range(x)
+    # Lagrange points lie between the expansion point and represented values.
+    derivative_lower = jnp.minimum(input_bounds.lower, c)
+    derivative_upper = jnp.maximum(input_bounds.upper, c)
+
+    if function == "sin":
+        return _second_order_candidate(
+            x,
+            jnp.sin(c),
+            jnp.cos(c),
+            -jnp.sin(c),
+            Interval(-jnp.ones_like(c), jnp.ones_like(c)),
+        )
+    if function == "cos":
+        return _second_order_candidate(
+            x,
+            jnp.cos(c),
+            -jnp.sin(c),
+            -jnp.cos(c),
+            Interval(-jnp.ones_like(c), jnp.ones_like(c)),
+        )
+
+    top = _top_like(x)
+    if function == "sqrt":
+        defined = input_bounds.lower >= 0
+        regular_precondition = defined & (derivative_lower > 0) & jnp.isfinite(c)
+        safe_c = jnp.where(regular_precondition, c, 1)
+        safe_lower = jnp.where(regular_precondition, derivative_lower, 1)
+        safe_upper = jnp.where(regular_precondition, derivative_upper, 1)
+        root = jnp.sqrt(safe_c)
+        f0, f1, f2 = root, 0.5 / root, -0.25 / (safe_c * root)
+        third = Interval(
+            3 / (8 * safe_upper**2.5),
+            3 / (8 * safe_lower**2.5),
+        )
+        regular = regular_precondition & jnp.isfinite(f0)
+        regular &= jnp.isfinite(f1) & jnp.isfinite(f2)
+        candidate = _second_order_candidate(x, f0, f1, f2, third)
+
+        safe_bound_lower = jnp.where(defined, input_bounds.lower, 0)
+        safe_bound_upper = jnp.where(defined, input_bounds.upper, 0)
+        fallback = _interval_only(
+            jnp.sqrt(safe_bound_lower), jnp.sqrt(safe_bound_upper), x
+        )
+        return _where_model(regular, candidate, _where_model(defined, fallback, top))
+
+    if function == "reciprocal":
+        represented_excludes_zero = (input_bounds.lower > 0) | (
+            input_bounds.upper < 0
+        )
+        derivative_excludes_zero = (derivative_lower > 0) | (
+            derivative_upper < 0
+        )
+        regular_precondition = (
+            represented_excludes_zero
+            & derivative_excludes_zero
+            & jnp.isfinite(c)
+        )
+        safe_c = jnp.where(regular_precondition, c, 1)
+        safe_lower = jnp.where(regular_precondition, derivative_lower, 1)
+        safe_upper = jnp.where(regular_precondition, derivative_upper, 1)
+        f0, f1, f2 = 1 / safe_c, -1 / safe_c**2, 2 / safe_c**3
+        third_at_lower = -6 / safe_lower**4
+        third_at_upper = -6 / safe_upper**4
+        third = Interval(
+            jnp.minimum(third_at_lower, third_at_upper),
+            jnp.maximum(third_at_lower, third_at_upper),
+        )
+        regular = regular_precondition & jnp.isfinite(f0)
+        regular &= jnp.isfinite(f1) & jnp.isfinite(f2)
+        candidate = _second_order_candidate(x, f0, f1, f2, third)
+        fallback_bounds = _ireciprocal(input_bounds)
+        fallback = _interval_only(
+            fallback_bounds.lower, fallback_bounds.upper, x
+        )
+        return _where_model(
+            regular,
+            candidate,
+            _where_model(represented_excludes_zero, fallback, top),
+        )
+
+    if function == "power":
+        p = jnp.asarray(exponent)
+        if p.ndim != 0:
+            raise ValueError("experimental Taylor power exponent must be scalar")
+        if not (
+            jnp.issubdtype(p.dtype, jnp.integer)
+            or jnp.issubdtype(p.dtype, jnp.floating)
+        ):
+            return top
+
+        exponent_finite = jnp.isfinite(p)
+        positive_segment = derivative_lower > 0
+        regular_precondition = positive_segment & exponent_finite & jnp.isfinite(c)
+        safe_p = jnp.where(exponent_finite, p, 1)
+        safe_c = jnp.where(regular_precondition, c, 1)
+        safe_lower = jnp.where(regular_precondition, derivative_lower, 1)
+        safe_upper = jnp.where(regular_precondition, derivative_upper, 1)
+        f0 = safe_c**safe_p
+        f1 = safe_p * safe_c ** (safe_p - 1)
+        f2 = safe_p * (safe_p - 1) * safe_c ** (safe_p - 2)
+        third_factor = safe_p * (safe_p - 1) * (safe_p - 2)
+        third_at_lower = third_factor * safe_lower ** (safe_p - 3)
+        third_at_upper = third_factor * safe_upper ** (safe_p - 3)
+        third = Interval(
+            jnp.minimum(third_at_lower, third_at_upper),
+            jnp.maximum(third_at_lower, third_at_upper),
+        )
+        regular = regular_precondition & jnp.isfinite(f0)
+        regular &= jnp.isfinite(f1) & jnp.isfinite(f2)
+        regular &= jnp.isfinite(third.lower) & jnp.isfinite(third.upper)
+        candidate = _second_order_candidate(x, f0, f1, f2, third)
+
+        nonnegative = input_bounds.lower >= 0
+        safe_bound_lower = jnp.where(nonnegative, input_bounds.lower, 1)
+        safe_bound_upper = jnp.where(nonnegative, input_bounds.upper, 1)
+        first = safe_bound_lower**safe_p
+        second = safe_bound_upper**safe_p
+        fallback_lower = jnp.minimum(first, second)
+        fallback_upper = jnp.maximum(first, second)
+        finite_fallback = nonnegative & exponent_finite
+        finite_fallback &= jnp.isfinite(fallback_lower) & jnp.isfinite(fallback_upper)
+        fallback = _interval_only(fallback_lower, fallback_upper, x)
+        return _where_model(
+            regular, candidate, _where_model(finite_fallback, fallback, top)
+        )
+
+    raise ValueError(function)  # pragma: no cover - private static dispatch
 
 
 def _sin(x, **_):
@@ -650,19 +972,12 @@ def _pow(x, y):
     if not isinstance(x, TaylorModel) and not isinstance(y, TaylorModel):
         return lax.pow_p.bind(x, y)
     if isinstance(y, TaylorModel):
-        if not _is_point_model(y):
-            raise NotImplementedError(
-                "experimental Taylor pow requires a point-valued exponent"
-            )
-        y = y.constant
+        raise NotImplementedError(
+            "experimental Taylor pow requires a raw point exponent, not a "
+            "Taylor-model exponent"
+        )
     if not isinstance(x, TaylorModel):
         return x**y
-    try:
-        integer = float(np.asarray(y)).is_integer()
-    except (TypeError, ValueError, jax.errors.TracerArrayConversionError):
-        integer = False
-    if integer and int(np.asarray(y)) in (0, 1, 2):
-        return _integer_pow(x, y=int(np.asarray(y)))
     return _unary_second_order(x, "power", exponent=y)
 
 
@@ -670,13 +985,11 @@ def _integer_pow(x, *, y):
     if not isinstance(x, TaylorModel):
         return lax.integer_pow_p.bind(x, y=y)
     if y == 0:
-        return constant_taylor_model(
-            jnp.ones_like(x.constant), x.domain_lower, x.domain_upper
-        )
+        return constant_taylor_model(jnp.ones_like(x.constant), x)
     if y == 1:
         return x
     if y == 2:
-        return _mul(x, x)
+        return _square(x)
     raise NotImplementedError(
         f"experimental Taylor integer_pow only supports 0, 1, 2; got {y}"
     )
@@ -715,18 +1028,6 @@ def _comparison(kind, x, y):
     raise ValueError(kind)
 
 
-def _require_fixed_predicate(pred: Interval, operation: str):
-    try:
-        fixed = np.array_equal(np.asarray(pred.lower), np.asarray(pred.upper))
-    except (TypeError, jax.errors.TracerArrayConversionError):
-        fixed = False
-    if not fixed:
-        raise NotImplementedError(
-            f"experimental Taylor {operation} requires a sign-fixed predicate"
-        )
-    return pred.lower
-
-
 def _boolean_binary(x, y, *, is_and):
     x = x if isinstance(x, Interval) else Interval(x, x)
     y = y if isinstance(y, Interval) else Interval(y, y)
@@ -763,31 +1064,119 @@ def _where_model(mask, yes: TaylorModel, no: TaylorModel) -> TaylorModel:
             jnp.where(mask, yes.remainder.lower, no.remainder.lower),
             jnp.where(mask, yes.remainder.upper, no.remainder.upper),
         ),
-        like,
     )
+
+
+def _select_models(which, cases) -> TaylorModel:
+    like = _template(*cases)
+    promoted = [_promote(case, like) for case in cases]
+    result = promoted[0]
+    for index, case in enumerate(promoted[1:], start=1):
+        result = _where_model(which == index, case, result)
+    return result
+
+
+def _hull_models(cases, selection_shape=()) -> TaylorModel:
+    like = _template(*cases)
+    promoted = [_promote(case, like) for case in cases]
+    shape = jnp.broadcast_shapes(selection_shape, *(case.shape for case in promoted))
+    promoted = [_broadcast_model(case, shape) for case in promoted]
+    ranges = [taylor_range(case) for case in promoted]
+    lower = jnp.min(jnp.stack([bounds.lower for bounds in ranges]), axis=0)
+    upper = jnp.max(jnp.stack([bounds.upper for bounds in ranges]), axis=0)
+    return _interval_only(lower, upper, promoted[0])
+
+
+def _select_intervals(which, cases) -> Interval:
+    shape = jnp.broadcast_shapes(
+        jnp.shape(which),
+        *(case.shape for case in cases),
+    )
+    which = jnp.broadcast_to(which, shape)
+    lowers = [jnp.broadcast_to(case.lower, shape) for case in cases]
+    uppers = [jnp.broadcast_to(case.upper, shape) for case in cases]
+    lower, upper = lowers[0], uppers[0]
+    for index, (case_lower, case_upper) in enumerate(
+        zip(lowers[1:], uppers[1:]), start=1
+    ):
+        selected = which == index
+        lower = jnp.where(selected, case_lower, lower)
+        upper = jnp.where(selected, case_upper, upper)
+    return Interval(lower, upper)
 
 
 def _select_n(which, *cases):
     if isinstance(which, Interval):
-        which = _require_fixed_predicate(which, "select")
+        fixed = which.lower == which.upper
+        if any(isinstance(case, TaylorModel) for case in cases):
+            selected = _select_models(which.lower, cases)
+            hull = _hull_models(cases, jnp.shape(fixed))
+            return _where_model(fixed, selected, hull)
+        intervals = [
+            case if isinstance(case, Interval) else Interval(case, case)
+            for case in cases
+        ]
+        selected = _select_intervals(which.lower, intervals)
+        shape = selected.shape
+        hull_lower = jnp.min(
+            jnp.stack([jnp.broadcast_to(case.lower, shape) for case in intervals]),
+            axis=0,
+        )
+        hull_upper = jnp.max(
+            jnp.stack([jnp.broadcast_to(case.upper, shape) for case in intervals]),
+            axis=0,
+        )
+        fixed = jnp.broadcast_to(fixed, shape)
+        return Interval(
+            jnp.where(fixed, selected.lower, hull_lower),
+            jnp.where(fixed, selected.upper, hull_upper),
+        )
     if not any(isinstance(case, TaylorModel) for case in cases):
         if any(isinstance(case, Interval) for case in cases):
             intervals = [
                 case if isinstance(case, Interval) else Interval(case, case)
                 for case in cases
             ]
-            return Interval(
-                lax.select_n(which, *[case.lower for case in intervals]),
-                lax.select_n(which, *[case.upper for case in intervals]),
-            )
+            return _select_intervals(which, intervals)
         return lax.select_n(which, *cases)
-    if len(cases) == 2 and jnp.asarray(which).dtype == jnp.bool_:
-        return _where_model(which, cases[1], cases[0])
-    like = _template(*cases)
-    result = _promote(cases[0], like)
-    for index, case in enumerate(cases[1:], start=1):
-        result = _where_model(which == index, _promote(case, like), result)
-    return result
+    return _select_models(which, cases)
+
+
+def taylor_relu(x):
+    """Apply exact fixed ReLU branches and a source-preserving crossing rule."""
+
+    if isinstance(x, Interval):
+        return Interval(jnp.maximum(x.lower, 0), jnp.maximum(x.upper, 0))
+    if not isinstance(x, TaylorModel):
+        return jnp.maximum(x, 0)
+
+    bounds = taylor_range(x)
+    active = bounds.lower >= 0
+    inactive = bounds.upper <= 0
+    crossing = ~(active | inactive)
+    finite_crossing = crossing & jnp.isfinite(bounds.lower)
+    finite_crossing &= jnp.isfinite(bounds.upper)
+    safe_lower = jnp.where(finite_crossing, bounds.lower, -1)
+    safe_upper = jnp.where(finite_crossing, bounds.upper, 1)
+    denominator = safe_upper - safe_lower
+    slope = safe_upper / denominator
+    error_upper = -safe_lower * safe_upper / denominator
+    scaled = _scale_model(x, slope)
+    crossing_model = _new(
+        scaled.constant,
+        scaled.linear,
+        scaled.quadratic,
+        _iadd(
+            scaled.remainder,
+            Interval(jnp.zeros_like(error_upper), error_upper),
+        ),
+    )
+    fallback = _interval_only(
+        jnp.maximum(bounds.lower, 0), jnp.maximum(bounds.upper, 0), x
+    )
+    crossing_model = _where_model(finite_crossing, crossing_model, fallback)
+    zero = constant_taylor_model(jnp.zeros_like(x.constant), x)
+    return _where_model(active, x, _where_model(inactive, zero, crossing_model))
 
 
 def _max_or_min(x, y, *, is_max):
@@ -795,10 +1184,29 @@ def _max_or_min(x, y, *, is_max):
     # Taylor model.  Handling Interval first would attempt to store a
     # TaylorModel object as an Interval endpoint.
     if isinstance(x, TaylorModel) or isinstance(y, TaylorModel):
-        pred = _comparison("ge" if is_max else "le", x, y)
-        mask = _require_fixed_predicate(pred, "maximum/minimum")
         like = _template(x, y)
-        return _where_model(mask, _promote(x, like), _promote(y, like))
+        left, right = _promote(x, like), _promote(y, like)
+        difference = _sub(left, right)
+        bounds = taylor_range(difference)
+        left_above = bounds.lower >= 0
+        left_below = bounds.upper <= 0
+        relu_difference = taylor_relu(difference)
+        crossing = (
+            _add(right, relu_difference)
+            if is_max
+            else _sub(left, relu_difference)
+        )
+        if is_max:
+            return _where_model(
+                left_above,
+                left,
+                _where_model(left_below, right, crossing),
+            )
+        return _where_model(
+            left_above,
+            right,
+            _where_model(left_below, left, crossing),
+        )
     if isinstance(x, Interval) or isinstance(y, Interval):
         x = x if isinstance(x, Interval) else Interval(x, x)
         y = y if isinstance(y, Interval) else Interval(y, y)
@@ -810,16 +1218,7 @@ def _max_or_min(x, y, *, is_max):
 def _abs(x):
     if not isinstance(x, TaylorModel):
         return jnp.abs(x)
-    bounds = taylor_range(x)
-    positive = bounds.lower >= 0
-    negative = bounds.upper <= 0
-    try:
-        fixed = bool(np.all(np.asarray(positive | negative)))
-    except (TypeError, jax.errors.TracerArrayConversionError):
-        fixed = False
-    if not fixed:
-        raise NotImplementedError("experimental Taylor abs crosses zero")
-    return _where_model(positive, x, -x)
+    return _max_or_min(x, -x, is_max=True)
 
 
 def _apply_unary_value_linear(primitive, x: TaylorModel, **params) -> TaylorModel:
@@ -848,7 +1247,6 @@ def _apply_unary_value_linear(primitive, x: TaylorModel, **params) -> TaylorMode
             primitive.bind(x.remainder.lower, **params),
             primitive.bind(x.remainder.upper, **params),
         ),
-        x,
     )
 
 
@@ -863,7 +1261,6 @@ def _value_transpose(x: TaylorModel, axes) -> TaylorModel:
             jnp.transpose(x.remainder.lower, axes),
             jnp.transpose(x.remainder.upper, axes),
         ),
-        x,
     )
 
 
@@ -895,7 +1292,6 @@ def _concatenate(*values, **params):
                 [value.remainder.upper for value in values], axis=dimension
             ),
         ),
-        like,
     )
 
 
@@ -952,7 +1348,6 @@ def _scatter_linear(primitive, operand, indices, updates, **params):
             apply(operand.remainder.lower, updates.remainder.lower),
             apply(operand.remainder.upper, updates.remainder.upper),
         ),
-        like,
     )
 
 
@@ -977,8 +1372,33 @@ def _moveaxis(x: TaylorModel, source, destination) -> TaylorModel:
             jnp.moveaxis(x.remainder.lower, source, destination),
             jnp.moveaxis(x.remainder.upper, source, destination),
         ),
-        x,
     )
+
+
+def _split(x, *, sizes, axis):
+    if not isinstance(x, TaylorModel):
+        return lax.split_p.bind(x, sizes=sizes, axis=axis)
+    outputs = []
+    start = 0
+    for size in sizes:
+        stop = start + operator.index(size)
+
+        def value_slice(value):
+            return lax.slice_in_dim(value, start, stop, axis=axis)
+
+        outputs.append(
+            TaylorModel(
+                value_slice(x.constant),
+                value_slice(x.linear),
+                value_slice(x.quadratic),
+                Interval(
+                    value_slice(x.remainder.lower),
+                    value_slice(x.remainder.upper),
+                ),
+            )
+        )
+        start = stop
+    return outputs
 
 
 def _dot_general(a, b, **params):
@@ -1098,6 +1518,9 @@ taylor_inclusion_registry.update(
         lax.dot_general_p: _dot_general,
     }
 )
+
+if hasattr(lax, "split_p"):
+    taylor_inclusion_registry[lax.split_p] = _split
 
 
 def _jit_rule(*args, **params):

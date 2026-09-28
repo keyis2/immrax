@@ -180,3 +180,63 @@ def test_lin_sys_natif(x_vec, u_vec, x_interval, u_interval):
     combined_interval = irx.interval(combined_lower, combined_upper)
 
     validate_overapproximation_nd(wrapped_lin_sys, combined_interval, result)
+
+
+@pytest.mark.parametrize("reduction", [jnp.argmin, jnp.argmax])
+def test_natif_argextrema_preserve_disconnected_candidates(reduction):
+    """Indexing must not fill gaps between feasible arg-extremum indices."""
+    values = jnp.array([1.0] + [100.0] * 8 + [9.0])
+    if reduction is jnp.argmin:
+        bounds = irx.interval(
+            jnp.array([0.0] + [5.0] * 8 + [0.0]),
+            jnp.array([2.0] + [6.0] * 8 + [2.0]),
+        )
+    else:
+        bounds = irx.interval(
+            jnp.array([8.0] + [4.0] * 8 + [8.0]),
+            jnp.array([10.0] + [5.0] * 8 + [10.0]),
+        )
+
+    result = irx.natif(lambda a, b: a[reduction(b)])(values, bounds)
+
+    # Only indices 0 and 9 are feasible.  In particular, the large values at
+    # indices 1..8 must not leak in through the public index hull [0, 9].
+    assert isinstance(result, irx.Interval)
+    assert result.lower == 1.0
+    assert result.upper == 9.0
+
+    interval_values = irx.interval(values - 0.5, values + 0.5)
+    interval_result = irx.natif(lambda a, b: a[reduction(b)])(
+        interval_values, bounds
+    )
+    assert interval_result.lower == 0.5
+    assert interval_result.upper == 9.5
+
+
+@pytest.mark.parametrize("reduction", [jnp.argmin, jnp.argmax])
+def test_natif_argextrema_point_interval_uses_first_tie(reduction):
+    values = jnp.array([4.0, 7.0, 9.0])
+    bounds = irx.interval(jnp.array([1.0, 1.0, 2.0]))
+    if reduction is jnp.argmax:
+        bounds = irx.interval(jnp.array([2.0, 2.0, 1.0]))
+
+    index = irx.natif(reduction)(bounds)
+    selected = irx.natif(lambda a, b: a[reduction(b)])(values, bounds)
+
+    assert index.lower == 0
+    assert index.upper == 0
+    assert selected.lower == values[0]
+    assert selected.upper == values[0]
+
+
+def test_natif_argmin_axis_indexing_uses_per_output_candidates():
+    values = jnp.array([1.0, 100.0, 9.0])
+    bounds = irx.interval(
+        jnp.array([[0.0, 5.0, 0.0], [5.0, 0.0, 5.0]]),
+        jnp.array([[2.0, 6.0, 2.0], [6.0, 1.0, 6.0]]),
+    )
+
+    result = irx.natif(lambda a, b: a[jnp.argmin(b, axis=1)])(values, bounds)
+
+    assert jnp.array_equal(result.lower, jnp.array([1.0, 100.0]))
+    assert jnp.array_equal(result.upper, jnp.array([9.0, 100.0]))

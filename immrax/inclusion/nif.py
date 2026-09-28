@@ -175,17 +175,245 @@ def _copy_predicate_metadata(dst: Interval, src: Interval) -> Interval:
     return dst
 
 
+class _DiscreteEnclosure:
+    """Internal, finite-valued enclosure carried between Jaxpr primitives.
+
+    ``Interval`` remains the public representation.  This metadata prevents a
+    disconnected set of possible indices, such as ``{0, 9}``, from being
+    prematurely widened to every integer in ``[0, 9]`` while the index is used
+    by a later gather/dynamic-slice operation.
+    """
+
+    def __init__(self, lower, upper, mask, source):
+        self.lower = lower
+        self.upper = upper
+        self.mask = mask
+        self.source = source
+
+
+def _discrete_enclosure(x):
+    return getattr(x, "_discrete_enclosure", None) if isinstance(x, Interval) else None
+
+
+def _masked_hull(lower, upper, mask):
+    """Hull scenario bounds along their final (finite-choice) dimension."""
+    out_lower = lower[..., 0]
+    out_upper = upper[..., 0]
+    seen = jnp.zeros_like(mask[..., 0], dtype=jnp.bool_)
+    for i in range(lower.shape[-1]):
+        active = mask[..., i]
+        out_lower = jnp.where(
+            active,
+            jnp.where(seen, jnp.minimum(out_lower, lower[..., i]), lower[..., i]),
+            out_lower,
+        )
+        out_upper = jnp.where(
+            active,
+            jnp.where(seen, jnp.maximum(out_upper, upper[..., i]), upper[..., i]),
+            out_upper,
+        )
+        seen = jnp.logical_or(seen, active)
+    return out_lower, out_upper
+
+
+def _with_discrete_enclosure(
+    out: Interval, lower, upper, mask, source, *, tighten=True
+) -> Interval:
+    if tighten:
+        out.lower, out.upper = _masked_hull(lower, upper, mask)
+    out._discrete_enclosure = _DiscreteEnclosure(lower, upper, mask, source)
+    return out
+
+
+def _scenario_bounds(x, source, scenario_count):
+    """Lift an interval into scenarios, retaining correlation when available."""
+    x = interval(x)
+    discrete = _discrete_enclosure(x)
+    if discrete is not None:
+        if discrete.source is not source:
+            return None
+        return discrete.lower, discrete.upper, discrete.mask
+    mask = jnp.ones(x.shape + (scenario_count,), dtype=jnp.bool_)
+    return x.lower[..., None], x.upper[..., None], mask
+
+
+def _inclusion_argminmax_p(x, *, axes, index_dtype, is_min):
+    """Keep the exact feasible argmin/argmax indices as internal metadata."""
+    x = interval(x)
+    axis, = axes
+    lower = jnp.moveaxis(x.lower, axis, -1)
+    upper = jnp.moveaxis(x.upper, axis, -1)
+    size = lower.shape[-1]
+    reduction_axis = lower.ndim - 1
+
+    if is_min:
+        # JAX resolves equal extrema to the first index.  An earlier competitor
+        # must therefore be made strictly larger than candidate i.
+        earlier_extreme = lax.cummin(upper, axis=reduction_axis)
+        later_extreme = lax.cummin(upper, axis=reduction_axis, reverse=True)
+        earlier_feasible = jnp.concatenate(
+            [
+                jnp.ones_like(lower[..., :1], dtype=jnp.bool_),
+                lower[..., 1:] < earlier_extreme[..., :-1],
+            ],
+            axis=-1,
+        )
+        later_feasible = jnp.concatenate(
+            [
+                lower[..., :-1] <= later_extreme[..., 1:],
+                jnp.ones_like(lower[..., :1], dtype=jnp.bool_),
+            ],
+            axis=-1,
+        )
+    else:
+        earlier_extreme = lax.cummax(lower, axis=reduction_axis)
+        later_extreme = lax.cummax(lower, axis=reduction_axis, reverse=True)
+        earlier_feasible = jnp.concatenate(
+            [
+                jnp.ones_like(upper[..., :1], dtype=jnp.bool_),
+                upper[..., 1:] > earlier_extreme[..., :-1],
+            ],
+            axis=-1,
+        )
+        later_feasible = jnp.concatenate(
+            [
+                upper[..., :-1] >= later_extreme[..., 1:],
+                jnp.ones_like(upper[..., :1], dtype=jnp.bool_),
+            ],
+            axis=-1,
+        )
+
+    candidate_mask = jnp.logical_and(earlier_feasible, later_feasible)
+    if jnp.issubdtype(x.dtype, jnp.inexact):
+        # NaN endpoint semantics are not meaningful interval bounds.  Retain
+        # soundness by considering every index possible for such a slice.
+        has_nan = jnp.any(jnp.isnan(lower) | jnp.isnan(upper), axis=-1)
+        candidate_mask = jnp.where(has_nan[..., None], True, candidate_mask)
+
+    values = jnp.broadcast_to(
+        jnp.arange(size, dtype=index_dtype), candidate_mask.shape
+    )
+    out_lower, out_upper = _masked_hull(values, values, candidate_mask)
+    out = Interval(out_lower, out_upper)
+    return _with_discrete_enclosure(
+        out, values, values, candidate_mask, object(), tighten=False
+    )
+
+
+def _inclusion_argmin_p(x, **kwargs):
+    return _inclusion_argminmax_p(x, is_min=True, **kwargs)
+
+
+def _inclusion_argmax_p(x, **kwargs):
+    return _inclusion_argminmax_p(x, is_min=False, **kwargs)
+
+
+def _inclusion_broadcast_in_dim_p(x, **kwargs):
+    out = _make_inclusion_passthrough_p(lax.broadcast_in_dim_p)(x, **kwargs)
+    discrete = _discrete_enclosure(x)
+    if discrete is None:
+        return out
+
+    shape = tuple(kwargs["shape"])
+    dimensions = tuple(kwargs["broadcast_dimensions"])
+    scenario_count = discrete.lower.shape[-1]
+    scenario_kwargs = dict(kwargs)
+    scenario_kwargs["shape"] = shape + (scenario_count,)
+    scenario_kwargs["broadcast_dimensions"] = dimensions + (len(shape),)
+    lower = lax.broadcast_in_dim_p.bind(discrete.lower, **scenario_kwargs)
+    upper = lax.broadcast_in_dim_p.bind(discrete.upper, **scenario_kwargs)
+    mask = lax.broadcast_in_dim_p.bind(discrete.mask, **scenario_kwargs)
+    return _with_discrete_enclosure(
+        out, lower, upper, mask, discrete.source, tighten=False
+    )
+
+
+def _inclusion_dynamic_slice_p(operand, *start_indices, **kwargs):
+    """Hull slices over the finite index choices retained by argmin/argmax."""
+    operand = interval(operand)
+    uncertain = [
+        (i, _discrete_enclosure(index))
+        for i, index in enumerate(start_indices)
+        if _discrete_enclosure(index) is not None
+    ]
+    if len(uncertain) != 1:
+        return _make_inclusion_passthrough_p(lax.dynamic_slice_p)(
+            operand, *start_indices, **kwargs
+        )
+
+    uncertain_position, discrete = uncertain[0]
+    if discrete.lower.ndim != 1:
+        raise NotImplementedError(
+            "dynamic_slice currently supports scalar argmin/argmax indices"
+        )
+
+    scenario_lowers = []
+    scenario_uppers = []
+    for scenario in range(discrete.lower.shape[-1]):
+        starts = [
+            index.lower if isinstance(index, Interval) else index
+            for index in start_indices
+        ]
+        starts[uncertain_position] = discrete.lower[scenario]
+        scenario_lowers.append(
+            lax.dynamic_slice_p.bind(operand.lower, *starts, **kwargs)
+        )
+        scenario_uppers.append(
+            lax.dynamic_slice_p.bind(operand.upper, *starts, **kwargs)
+        )
+
+    lower = jnp.moveaxis(jnp.stack(scenario_lowers), 0, -1)
+    upper = jnp.moveaxis(jnp.stack(scenario_uppers), 0, -1)
+    mask = jnp.broadcast_to(discrete.mask, lower.shape)
+    out = Interval(lower[..., 0], upper[..., 0])
+    return _with_discrete_enclosure(out, lower, upper, mask, discrete.source)
+
+
+def _inclusion_gather_p(operand, start_indices, **kwargs):
+    """Hull gather results over retained finite index choices."""
+    operand = interval(operand)
+    discrete = _discrete_enclosure(start_indices)
+    if discrete is None:
+        return _make_inclusion_passthrough_p(lax.gather_p)(
+            operand, start_indices, **kwargs
+        )
+
+    scenario_lowers = []
+    scenario_uppers = []
+    for scenario in range(discrete.lower.shape[-1]):
+        indices = discrete.lower[..., scenario]
+        scenario_lowers.append(lax.gather_p.bind(operand.lower, indices, **kwargs))
+        scenario_uppers.append(lax.gather_p.bind(operand.upper, indices, **kwargs))
+
+    lower = jnp.moveaxis(jnp.stack(scenario_lowers), 0, -1)
+    upper = jnp.moveaxis(jnp.stack(scenario_uppers), 0, -1)
+    # Gather output positions inherit the candidate mask of the corresponding
+    # index position.  Broadcasting handles scalar and common advanced-index
+    # forms; if JAX produces a more exotic layout, conservatively retain all
+    # enumerated scenarios.
+    try:
+        # The penultimate dimension is gather's index-vector dimension; all
+        # components of an index vector must belong to the same scenario.
+        candidate_mask = (
+            jnp.all(discrete.mask, axis=-2)
+            if discrete.mask.ndim >= 2
+            else discrete.mask
+        )
+        mask = jnp.broadcast_to(candidate_mask, lower.shape)
+    except ValueError:
+        mask = jnp.ones_like(lower, dtype=jnp.bool_)
+    out = Interval(lower[..., 0], upper[..., 0])
+    return _with_discrete_enclosure(out, lower, upper, mask, discrete.source)
+
+
 # We would like to passthrough array operations like reshaping, slicing, etc.
 _add_passthrough_to_registry(lax.copy_p)
 _add_passthrough_to_registry(lax.reshape_p)
 _add_passthrough_to_registry(lax.slice_p)
 _add_passthrough_to_registry(lax.split_p)
-_add_passthrough_to_registry(lax.dynamic_slice_p)
 _add_passthrough_to_registry(lax.squeeze_p)
 _add_passthrough_to_registry(lax.transpose_p)
-_add_passthrough_to_registry(lax.broadcast_in_dim_p)
 _add_passthrough_to_registry(lax.concatenate_p)
-_add_passthrough_to_registry(lax.gather_p)
 _add_passthrough_to_registry(lax.scatter_p)
 _add_passthrough_to_registry(lax.scatter_add_p)
 _add_passthrough_to_registry(lax.scatter_max_p)
@@ -219,6 +447,12 @@ _add_passthrough_to_registry(lax.or_p)
 _add_passthrough_to_registry(lax.not_p)
 
 _add_passthrough_to_registry(debug_callback_p)
+
+inclusion_registry[lax.argmin_p] = _inclusion_argmin_p
+inclusion_registry[lax.argmax_p] = _inclusion_argmax_p
+inclusion_registry[lax.broadcast_in_dim_p] = _inclusion_broadcast_in_dim_p
+inclusion_registry[lax.dynamic_slice_p] = _inclusion_dynamic_slice_p
+inclusion_registry[lax.gather_p] = _inclusion_gather_p
 
 """
 TODO: Handle higher order primitives
@@ -421,13 +655,40 @@ inclusion_registry[lax.cond_p] = _inclusion_cond_p
 
 def _inclusion_add_p(x: Interval, y: Interval) -> Interval:
     if isinstance(x, Interval) and isinstance(y, Interval):
-        return Interval(x.lower + y.lower, x.upper + y.upper)
+        out = Interval(x.lower + y.lower, x.upper + y.upper)
     elif isinstance(x, Interval):
-        return Interval(x.lower + y, x.upper + y)
+        out = Interval(x.lower + y, x.upper + y)
     elif isinstance(y, Interval):
-        return Interval(x + y.lower, x + y.upper)
+        out = Interval(x + y.lower, x + y.upper)
     else:
         return x + y
+
+    x_discrete = _discrete_enclosure(x)
+    y_discrete = _discrete_enclosure(y)
+    discrete = x_discrete or y_discrete
+    if discrete is None:
+        return out
+    if (
+        x_discrete is not None
+        and y_discrete is not None
+        and x_discrete.source is not y_discrete.source
+    ):
+        return out
+
+    scenario_count = discrete.lower.shape[-1]
+    x_scenarios = _scenario_bounds(x, discrete.source, scenario_count)
+    y_scenarios = _scenario_bounds(y, discrete.source, scenario_count)
+    if x_scenarios is None or y_scenarios is None:
+        return out
+    xl, xu, xm = x_scenarios
+    yl, yu, ym = y_scenarios
+    return _with_discrete_enclosure(
+        out,
+        xl + yl,
+        xu + yu,
+        jnp.logical_and(xm, ym),
+        discrete.source,
+    )
 
 
 inclusion_registry[lax.add_p] = _inclusion_add_p
@@ -509,9 +770,50 @@ def _with_true_domain(pred: Interval, source: Interval, lower, upper) -> Interva
     return pred
 
 
+def _with_discrete_comparison(pred, x, y, comparison):
+    x_discrete = _discrete_enclosure(x)
+    y_discrete = _discrete_enclosure(y)
+    discrete = x_discrete or y_discrete
+    if discrete is None:
+        return pred
+    if (
+        x_discrete is not None
+        and y_discrete is not None
+        and x_discrete.source is not y_discrete.source
+    ):
+        return pred
+
+    scenario_count = discrete.lower.shape[-1]
+    x_scenarios = _scenario_bounds(x, discrete.source, scenario_count)
+    y_scenarios = _scenario_bounds(y, discrete.source, scenario_count)
+    if x_scenarios is None or y_scenarios is None:
+        return pred
+    xl, xu, xm = x_scenarios
+    yl, yu, ym = y_scenarios
+
+    if comparison == "lt":
+        lower, upper = xu < yl, xl < yu
+    elif comparison == "le":
+        lower, upper = xu <= yl, xl <= yu
+    elif comparison == "gt":
+        lower, upper = xl > yu, xu > yl
+    elif comparison == "ge":
+        lower, upper = xl >= yu, xu >= yl
+    else:
+        raise ValueError(f"Unknown comparison {comparison}")
+    return _with_discrete_enclosure(
+        pred,
+        lower,
+        upper,
+        jnp.logical_and(xm, ym),
+        discrete.source,
+    )
+
+
 def _inclusion_lt_p(x, y) -> Interval:
     xl, xu, yl, yu = _comparison_bounds(x, y)
     pred = Interval(xu < yl, xl < yu)
+    pred = _with_discrete_comparison(pred, x, y, "lt")
     if isinstance(x, Interval) and not isinstance(y, Interval):
         pred = _with_true_domain(pred, x, -jnp.inf, y)
     return pred
@@ -520,6 +822,7 @@ def _inclusion_lt_p(x, y) -> Interval:
 def _inclusion_le_p(x, y) -> Interval:
     xl, xu, yl, yu = _comparison_bounds(x, y)
     pred = Interval(xu <= yl, xl <= yu)
+    pred = _with_discrete_comparison(pred, x, y, "le")
     if isinstance(x, Interval) and not isinstance(y, Interval):
         pred = _with_true_domain(pred, x, -jnp.inf, y)
     return pred
@@ -528,6 +831,7 @@ def _inclusion_le_p(x, y) -> Interval:
 def _inclusion_gt_p(x, y) -> Interval:
     xl, xu, yl, yu = _comparison_bounds(x, y)
     pred = Interval(xl > yu, xu > yl)
+    pred = _with_discrete_comparison(pred, x, y, "gt")
     if isinstance(x, Interval) and not isinstance(y, Interval):
         pred = _with_true_domain(pred, x, y, jnp.inf)
     return pred
@@ -536,6 +840,7 @@ def _inclusion_gt_p(x, y) -> Interval:
 def _inclusion_ge_p(x, y) -> Interval:
     xl, xu, yl, yu = _comparison_bounds(x, y)
     pred = Interval(xl >= yu, xu >= yl)
+    pred = _with_discrete_comparison(pred, x, y, "ge")
     if isinstance(x, Interval) and not isinstance(y, Interval):
         pred = _with_true_domain(pred, x, y, jnp.inf)
     return pred
@@ -612,10 +917,43 @@ def _inclusion_select_n_p(which, *cases) -> Interval:
         true_only = which.lower
         false_only = jnp.logical_not(which.upper)
         hull = _hull2(false_case, true_case)
-        return Interval(
+        out = Interval(
             jnp.where(true_only, true_case.lower, jnp.where(false_only, false_case.lower, hull.lower)),
             jnp.where(true_only, true_case.upper, jnp.where(false_only, false_case.upper, hull.upper)),
         )
+        discrete_parts = [
+            discrete
+            for discrete in (
+                _discrete_enclosure(which),
+                _discrete_enclosure(false_case),
+                _discrete_enclosure(true_case),
+            )
+            if discrete is not None
+        ]
+        if not discrete_parts:
+            return out
+        source = discrete_parts[0].source
+        if any(discrete.source is not source for discrete in discrete_parts[1:]):
+            return out
+
+        scenario_count = discrete_parts[0].lower.shape[-1]
+        which_scenarios = _scenario_bounds(which, source, scenario_count)
+        false_scenarios = _scenario_bounds(false_case, source, scenario_count)
+        true_scenarios = _scenario_bounds(true_case, source, scenario_count)
+        if any(
+            scenarios is None
+            for scenarios in (which_scenarios, false_scenarios, true_scenarios)
+        ):
+            return out
+        wl, wu, wm = which_scenarios
+        fl, fu, fm = false_scenarios
+        tl, tu, tm = true_scenarios
+        scenario_hull_lower = jnp.minimum(fl, tl)
+        scenario_hull_upper = jnp.maximum(fu, tu)
+        lower = jnp.where(wl, tl, jnp.where(jnp.logical_not(wu), fl, scenario_hull_lower))
+        upper = jnp.where(wl, tu, jnp.where(jnp.logical_not(wu), fu, scenario_hull_upper))
+        mask = jnp.logical_and(wm, jnp.logical_and(fm, tm))
+        return _with_discrete_enclosure(out, lower, upper, mask, source)
     lower = jnp.full_like(cases[0].lower, jnp.inf)
     upper = jnp.full_like(cases[0].upper, -jnp.inf)
     for i, case in enumerate(cases):

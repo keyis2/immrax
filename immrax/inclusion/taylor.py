@@ -41,7 +41,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from functools import wraps
 import operator
-from typing import Any
+from typing import Any, NamedTuple
 
 import equinox as eqx
 import jax
@@ -1177,6 +1177,350 @@ def taylor_relu(x):
     crossing_model = _where_model(finite_crossing, crossing_model, fallback)
     zero = constant_taylor_model(jnp.zeros_like(x.constant), x)
     return _where_model(active, x, _where_model(inactive, zero, crossing_model))
+
+
+_RELU_BRANCH_INACTIVE = 0
+_RELU_BRANCH_ACTIVE = 1
+_RELU_BRANCH_CROSSING = 2
+
+
+class QuadraticEndpointPair(NamedTuple):
+    """Zero-remainder quadratic lower/upper endpoint functions and status."""
+
+    lower: TaylorModel
+    upper: TaylorModel
+    preconditions_hold: jax.Array
+
+
+class _ReluEndpointFunctions(NamedTuple):
+    """Certified source-dependent endpoint functions for one scalar ReLU."""
+
+    lower: TaylorModel
+    upper: TaylorModel
+    branch_code: jax.Array
+    lower_nonnegative_margin: jax.Array
+    upper_nonnegative_margin: jax.Array
+    preconditions_hold: jax.Array
+
+
+class _EndpointProductPair(NamedTuple):
+    """Raw pair enclosing a product of two scalar ReLU Taylor tubes."""
+
+    lower: TaylorModel
+    upper: TaylorModel
+    first_endpoints: _ReluEndpointFunctions
+    second_endpoints: _ReluEndpointFunctions
+    preconditions_hold: jax.Array
+
+
+def _require_compatible_scalar_models(
+    first: TaylorModel, second: TaylorModel
+) -> None:
+    if first.shape != () or second.shape != ():
+        raise ValueError("endpoint products require scalar Taylor models")
+    _assert_compatible(first, second)
+
+
+def _model_is_finite(model: TaylorModel) -> jax.Array:
+    return (
+        jnp.all(jnp.isfinite(model.constant))
+        & jnp.all(jnp.isfinite(model.linear))
+        & jnp.all(jnp.isfinite(model.quadratic))
+        & jnp.all(jnp.isfinite(model.remainder.lower))
+        & jnp.all(jnp.isfinite(model.remainder.upper))
+    )
+
+
+def _quadratic_product_envelopes(
+    first: TaylorModel, second: TaylorModel
+) -> tuple[TaylorModel, TaylorModel]:
+    """Return fixed-rank degree-2 envelopes of a quadratic product.
+
+    Both scalar inputs have zero remainder and share normalized sources.  The
+    degree-at-most-two product is retained exactly.  A symmetric cubic tensor
+    supplies weighted-AM--GM radii in ``O(n**3)`` work/memory.  Quartic terms
+    use ``O(n**2)`` row reductions, with all-even monomials aggregated before
+    applying their sign-aware one-sided corrections.  The traced operation
+    count is independent of the source dimension.
+    """
+
+    _require_compatible_scalar_models(first, second)
+    zero_remainders = (
+        jnp.all(first.remainder.lower == 0.0)
+        & jnp.all(first.remainder.upper == 0.0)
+        & jnp.all(second.remainder.lower == 0.0)
+        & jnp.all(second.remainder.upper == 0.0)
+    )
+    first_quadratic = 0.5 * (first.quadratic + first.quadratic.T)
+    second_quadratic = 0.5 * (second.quadratic + second.quadratic.T)
+
+    constant = first.constant * second.constant
+    linear = (
+        first.constant * second.linear + second.constant * first.linear
+    )
+    retained_quadratic = (
+        first.constant * second_quadratic
+        + second.constant * first_quadratic
+        + jnp.outer(first.linear, second.linear)
+        + jnp.outer(second.linear, first.linear)
+    )
+
+    cubic = (
+        jnp.einsum("i,jk->ijk", first.linear, second_quadratic)
+        + jnp.einsum("j,ik->ijk", first.linear, second_quadratic)
+        + jnp.einsum("k,ij->ijk", first.linear, second_quadratic)
+        + jnp.einsum("i,jk->ijk", second.linear, first_quadratic)
+        + jnp.einsum("j,ik->ijk", second.linear, first_quadratic)
+        + jnp.einsum("k,ij->ijk", second.linear, first_quadratic)
+    ) / 6.0
+    cubic_radius = jnp.sum(jnp.abs(cubic), axis=(1, 2))
+
+    first_absolute = jnp.abs(first_quadratic)
+    second_absolute = jnp.abs(second_quadratic)
+    quartic_raw_radius = 0.125 * (
+        jnp.sum(first_absolute, axis=1) * jnp.sum(second_absolute)
+        + jnp.sum(second_absolute, axis=1) * jnp.sum(first_absolute)
+    )
+
+    first_diagonal = jnp.diag(first_quadratic)
+    second_diagonal = jnp.diag(second_quadratic)
+    diagonal_coefficient = 0.25 * first_diagonal * second_diagonal
+    even_coefficient = (
+        0.25
+        * (
+            jnp.outer(first_diagonal, second_diagonal)
+            + jnp.outer(second_diagonal, first_diagonal)
+        )
+        + first_quadratic * second_quadratic
+    )
+    even_raw_absolute = (
+        0.25
+        * (
+            jnp.abs(jnp.outer(first_diagonal, second_diagonal))
+            + jnp.abs(jnp.outer(second_diagonal, first_diagonal))
+        )
+        + jnp.abs(first_quadratic * second_quadratic)
+    )
+    off_diagonal = 1.0 - jnp.eye(
+        first.source_size, dtype=first.quadratic.dtype
+    )
+    even_coefficient = even_coefficient * off_diagonal
+    even_raw_absolute = even_raw_absolute * off_diagonal
+    even_raw_radius = jnp.abs(diagonal_coefficient) + 0.5 * jnp.sum(
+        even_raw_absolute, axis=1
+    )
+    remaining_quartic_radius = jnp.maximum(
+        quartic_raw_radius - even_raw_radius, 0.0
+    )
+    even_lower = jnp.minimum(diagonal_coefficient, 0.0) + 0.5 * jnp.sum(
+        jnp.minimum(even_coefficient, 0.0), axis=1
+    )
+    even_upper = jnp.maximum(diagonal_coefficient, 0.0) + 0.5 * jnp.sum(
+        jnp.maximum(even_coefficient, 0.0), axis=1
+    )
+    lower_correction = (
+        -cubic_radius - remaining_quartic_radius + even_lower
+    )
+    upper_correction = cubic_radius + remaining_quartic_radius + even_upper
+    lower = TaylorModel(
+        constant,
+        linear,
+        retained_quadratic + jnp.diag(2.0 * lower_correction),
+        _zero_interval(constant),
+    )
+    upper = TaylorModel(
+        constant,
+        linear,
+        retained_quadratic + jnp.diag(2.0 * upper_correction),
+        _zero_interval(constant),
+    )
+    valid = zero_remainders
+    return (
+        _where_model(valid, lower, _nan_model_like(lower)),
+        _where_model(valid, upper, _nan_model_like(upper)),
+    )
+
+
+def _nan_model_like(model: TaylorModel) -> TaylorModel:
+    nan = jnp.full_like(model.constant, jnp.nan)
+    return TaylorModel(
+        nan,
+        jnp.full_like(model.linear, jnp.nan),
+        jnp.full_like(model.quadratic, jnp.nan),
+        Interval(nan, nan),
+    )
+
+
+def _endpoint_pair_is_valid(
+    lower: TaylorModel, upper: TaylorModel
+) -> jax.Array:
+    _require_compatible_scalar_models(lower, upper)
+    zero_remainders = (
+        jnp.all(lower.remainder.lower == 0.0)
+        & jnp.all(lower.remainder.upper == 0.0)
+        & jnp.all(upper.remainder.lower == 0.0)
+        & jnp.all(upper.remainder.upper == 0.0)
+    )
+    return (
+        zero_remainders
+        & _model_is_finite(lower)
+        & _model_is_finite(upper)
+        & (polynomial_range(lower).lower >= 0.0)
+        & (polynomial_range(upper).lower >= 0.0)
+    )
+
+
+def nonnegative_endpoint_product(
+    first: QuadraticEndpointPair, second: QuadraticEndpointPair
+) -> QuadraticEndpointPair:
+    """Multiply two certified nonnegative source-dependent endpoint pairs."""
+
+    _require_compatible_scalar_models(first.lower, first.upper)
+    _require_compatible_scalar_models(second.lower, second.upper)
+    _assert_compatible(first.lower, second.lower)
+    lower, _ = _quadratic_product_envelopes(first.lower, second.lower)
+    _, upper = _quadratic_product_envelopes(first.upper, second.upper)
+    valid = (
+        first.preconditions_hold
+        & second.preconditions_hold
+        & _endpoint_pair_is_valid(first.lower, first.upper)
+        & _endpoint_pair_is_valid(second.lower, second.upper)
+        & _model_is_finite(lower)
+        & _model_is_finite(upper)
+    )
+    return QuadraticEndpointPair(lower, upper, valid)
+
+
+def _relu_endpoint_functions(model: TaylorModel) -> _ReluEndpointFunctions:
+    """Return certified source-dependent endpoints for a scalar ReLU tube."""
+
+    if model.shape != ():
+        raise ValueError("ReLU endpoint functions require a scalar model")
+    bounds = taylor_range(model)
+    inactive = bounds.upper <= 0.0
+    active = bounds.lower >= 0.0
+    branch_code = jnp.where(
+        inactive,
+        _RELU_BRANCH_INACTIVE,
+        jnp.where(active, _RELU_BRANCH_ACTIVE, _RELU_BRANCH_CROSSING),
+    )
+    zero = constant_taylor_model(jnp.zeros_like(model.constant), model)
+    original_lower, original_upper = taylor_endpoint_models(model)
+    _relu_lower, relu_upper = taylor_endpoint_models(taylor_relu(model))
+    lower = select_taylor_model(active, original_lower, zero)
+    upper = select_taylor_model(
+        inactive,
+        zero,
+        select_taylor_model(active, original_upper, relu_upper),
+    )
+    lower_margin = polynomial_range(lower).lower
+    upper_margin = polynomial_range(upper).lower
+    valid = (
+        jnp.isfinite(bounds.lower)
+        & jnp.isfinite(bounds.upper)
+        & _model_is_finite(model)
+        & _endpoint_pair_is_valid(lower, upper)
+    )
+    return _ReluEndpointFunctions(
+        lower,
+        upper,
+        branch_code,
+        lower_margin,
+        upper_margin,
+        valid,
+    )
+
+
+def relu_endpoint_pair(model: TaylorModel) -> QuadraticEndpointPair:
+    """Return the nonnegative source-dependent endpoints of scalar ReLU."""
+
+    endpoints = _relu_endpoint_functions(model)
+    return QuadraticEndpointPair(
+        endpoints.lower,
+        endpoints.upper,
+        endpoints.preconditions_hold,
+    )
+
+
+def _joint_endpoint_product(
+    first: TaylorModel, second: TaylorModel
+) -> _EndpointProductPair:
+    """Construct ``Q_L <= relu(first)*relu(second) <= Q_U``.
+
+    ReLU endpoint functions are nonnegative, so multiplication is monotone.
+    The raw endpoint products are reduced from degree four to degree two by
+    :func:`_quadratic_product_envelopes`.  An inactive factor selects exact
+    zero.  Invalid analytic preconditions are reported in the returned status
+    and never select generic Taylor multiplication as a fallback.
+    """
+
+    _require_compatible_scalar_models(first, second)
+    first_endpoints = _relu_endpoint_functions(first)
+    second_endpoints = _relu_endpoint_functions(second)
+    raw = nonnegative_endpoint_product(
+        QuadraticEndpointPair(
+            first_endpoints.lower,
+            first_endpoints.upper,
+            first_endpoints.preconditions_hold,
+        ),
+        QuadraticEndpointPair(
+            second_endpoints.lower,
+            second_endpoints.upper,
+            second_endpoints.preconditions_hold,
+        ),
+    )
+    either_inactive = (
+        (first_endpoints.branch_code == _RELU_BRANCH_INACTIVE)
+        | (second_endpoints.branch_code == _RELU_BRANCH_INACTIVE)
+    )
+    zero = constant_taylor_model(jnp.zeros_like(first.constant), first)
+    lower = select_taylor_model(either_inactive, zero, raw.lower)
+    upper = select_taylor_model(either_inactive, zero, raw.upper)
+    valid = (
+        first_endpoints.preconditions_hold
+        & second_endpoints.preconditions_hold
+        & raw.preconditions_hold
+    )
+    return _EndpointProductPair(
+        lower,
+        upper,
+        first_endpoints,
+        second_endpoints,
+        valid,
+    )
+
+
+def endpoint_pair_to_taylor(pair) -> TaylorModel:
+    """Convert ``Q_L <= p <= Q_U`` to one propagatable Taylor model.
+
+    Put ``M=(Q_L+Q_U)/2`` and ``H=(Q_U-Q_L)/2``.  Then
+    ``-H <= p-M <= H``.  The general termwise quadratic range provides
+    ``rho >= sup(H)``, so ``p`` lies in ``M + [-rho, rho]``.  Invalid input
+    status produces a NaN model rather than an arithmetic fallback.
+    """
+
+    midpoint = 0.5 * (pair.lower + pair.upper)
+    half_width = 0.5 * (pair.upper - pair.lower)
+    rho = jnp.maximum(0.0, polynomial_range(half_width).upper)
+    valid = (
+        pair.preconditions_hold
+        & _model_is_finite(pair.lower)
+        & _model_is_finite(pair.upper)
+        & jnp.isfinite(rho)
+    )
+    converted = TaylorModel(
+        midpoint.constant,
+        midpoint.linear,
+        midpoint.quadratic,
+        Interval(-rho, rho),
+    )
+    return _where_model(valid, converted, _nan_model_like(converted))
+
+
+def taylor_relu_product(first: TaylorModel, second: TaylorModel) -> TaylorModel:
+    """Enclose a scalar shared-source product ``relu(first)*relu(second)``."""
+
+    return endpoint_pair_to_taylor(_joint_endpoint_product(first, second))
 
 
 def _max_or_min(x, y, *, is_max):

@@ -505,6 +505,55 @@ def test_sin_and_cos_rules_contain_samples():
     _assert_contains(taylor_range(cosine), np.cos(np.asarray(argument_samples)))
 
 
+def test_atan_rule_contains_samples_and_is_jittable():
+    argument = _scalar_model(0.35, 0.7, -0.15, (-0.04, 0.06))
+    transform = tmif(jnp.arctan)
+    result = transform(argument)
+
+    _assert_unary_pointwise_contains(result, argument, jnp.arctan)
+    _assert_model_allclose(jax.jit(transform)(argument), result)
+    assert bool(jnp.any(result.linear != 0))
+
+
+@pytest.mark.parametrize(
+    ("lower", "upper"),
+    [
+        ([-0.4, 0.8], [0.5, 1.2]),
+        ([0.7, -0.4], [1.1, 0.5]),
+        ([-1.1, -0.4], [-0.7, 0.5]),
+        ([0.0, -1.2], [0.4, -0.8]),
+    ],
+)
+def test_atan2_certified_sector_rule_contains_samples_and_is_jittable(
+    lower, upper
+):
+    lower, upper = jnp.asarray(lower), jnp.asarray(upper)
+    seed = normalized_taylor_seed(lower, upper)
+    function = lambda value: jnp.arctan2(value[0], value[1])
+    transform = tmif(function)
+    result = transform(seed)
+
+    source_samples = _sources()
+    center, radius = (lower + upper) / 2, (upper - lower) / 2
+    samples = np.asarray(jax.vmap(function)(center + source_samples * radius))
+    _assert_contains(taylor_range(result), samples)
+    _assert_model_allclose(jax.jit(transform)(seed), result)
+    assert bool(jnp.any(result.linear != 0))
+
+
+def test_atan2_branch_cut_falls_back_and_point_origin_is_exact():
+    branch_cut = normalized_taylor_seed(
+        jnp.array([-0.2, -1.2]), jnp.array([0.2, -0.8])
+    )
+    function = lambda value: jnp.arctan2(value[0], value[1])
+    result = tmif(function)(branch_cut)
+    _assert_interval_only(result, -jnp.pi, jnp.pi)
+
+    origin = normalized_taylor_seed(jnp.zeros(2), jnp.zeros(2))
+    exact = tmif(function)(origin)
+    _assert_interval_only(exact, 0.0, 0.0)
+
+
 def test_positive_sqrt_and_power_rules_contain_samples():
     seed = normalized_taylor_seed(jnp.array([-0.2, -0.15]), jnp.array([0.2, 0.25]))
     argument = tmif(lambda z: 1.4 + 0.2 * z[0] + z[1] ** 2)(seed)

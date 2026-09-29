@@ -846,6 +846,31 @@ def _unary_second_order(x: TaylorModel, function: str, exponent=None) -> TaylorM
             Interval(-jnp.ones_like(c), jnp.ones_like(c)),
         )
 
+    if function == "atan":
+        input_is_real = ~jnp.isnan(input_bounds.lower)
+        input_is_real &= ~jnp.isnan(input_bounds.upper)
+        regular_precondition = input_is_real & jnp.isfinite(c)
+        safe_c = jnp.where(regular_precondition, c, 0)
+        denominator = 1 + safe_c**2
+        f0 = jnp.arctan(safe_c)
+        f1 = 1 / denominator
+        f2 = -2 * safe_c / denominator**2
+        # atan'''(u) = (6 u^2 - 2) / (1 + u^2)^3 lies in [-2, 1/2]
+        # globally.  The slightly wider symmetric bound keeps this rule simple
+        # while remaining valid on unbounded represented ranges.
+        third = Interval(-2 * jnp.ones_like(c), 2 * jnp.ones_like(c))
+        candidate = _second_order_candidate(x, f0, f1, f2, third)
+        fallback = _interval_only(
+            jnp.arctan(input_bounds.lower),
+            jnp.arctan(input_bounds.upper),
+            x,
+        )
+        return _where_model(
+            regular_precondition,
+            candidate,
+            _where_model(input_is_real, fallback, _top_like(x)),
+        )
+
     top = _top_like(x)
     if function == "sqrt":
         defined = input_bounds.lower >= 0
@@ -960,6 +985,59 @@ def _sin(x, **_):
 
 def _cos(x, **_):
     return _unary_second_order(x, "cos") if isinstance(x, TaylorModel) else jnp.cos(x)
+
+
+def _atan(x, **params):
+    if isinstance(x, Interval):
+        return Interval(jnp.arctan(x.lower), jnp.arctan(x.upper))
+    if isinstance(x, TaylorModel):
+        return _unary_second_order(x, "atan")
+    return lax.atan_p.bind(x, **params)
+
+
+def _atan2(y, x, **params):
+    if not isinstance(x, (TaylorModel, Interval)) and not isinstance(
+        y, (TaylorModel, Interval)
+    ):
+        return lax.atan2_p.bind(y, x, **params)
+
+    if not isinstance(x, TaylorModel) and not isinstance(y, TaylorModel):
+        y, x = _as_interval(y), _as_interval(x)
+        yl, yu, xl, xu = jnp.broadcast_arrays(
+            y.lower, y.upper, x.lower, x.upper
+        )
+        jointly_point = (yl == yu) & (xl == xu)
+        point = jnp.arctan2(yl, xl)
+        return Interval(
+            jnp.where(jointly_point, point, -jnp.pi),
+            jnp.where(jointly_point, point, jnp.pi),
+        )
+
+    like = _template(x, y)
+    x, y = _promote(x, like), _promote(y, like)
+    x_bounds, y_bounds = taylor_range(x), taylor_range(y)
+
+    right = _atan(_div(y, x))
+    upper_half = _sub(jnp.pi / 2, _atan(_div(x, y)))
+    lower_half = _sub(-jnp.pi / 2, _atan(_div(x, y)))
+    negative_x_nonnegative_y = _add(_atan(_div(y, x)), jnp.pi)
+    result = _interval_only(-jnp.pi, jnp.pi, like)
+    result = _where_model(
+        (x_bounds.upper < 0) & (y_bounds.lower >= 0),
+        negative_x_nonnegative_y,
+        result,
+    )
+    result = _where_model(y_bounds.upper < 0, lower_half, result)
+    result = _where_model(y_bounds.lower > 0, upper_half, result)
+    result = _where_model(x_bounds.lower > 0, right, result)
+
+    jointly_point = (x_bounds.lower == x_bounds.upper) & (
+        y_bounds.lower == y_bounds.upper
+    )
+    exact = constant_taylor_model(
+        jnp.arctan2(y_bounds.lower, x_bounds.lower), like
+    )
+    return _where_model(jointly_point, exact, result)
 
 
 def _sqrt(x, **params):
@@ -1814,6 +1892,8 @@ taylor_inclusion_registry.update(
         lax.div_p: _div,
         lax.sin_p: _sin,
         lax.cos_p: _cos,
+        lax.atan_p: _atan,
+        lax.atan2_p: _atan2,
         lax.sqrt_p: _sqrt,
         lax.pow_p: _pow,
         lax.integer_pow_p: _integer_pow,

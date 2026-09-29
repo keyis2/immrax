@@ -42,6 +42,7 @@ from .jacobian import (
     two_permutations,
 )
 from .nif import natif
+from .selection import argmin_select
 from .taylor import (
     QuadraticEndpointPair,
     TaylorModel,
@@ -79,6 +80,7 @@ __all__ = [
     "affif",
     "affine_bound",
     "affine_bound_to_interval",
+    "argmin_select",
     "aif",
     "all_corners",
     "all_permutations",

@@ -237,12 +237,10 @@ def _scenario_bounds(x, source, scenario_count):
     return x.lower[..., None], x.upper[..., None], mask
 
 
-def _inclusion_argminmax_p(x, *, axes, index_dtype, is_min):
-    """Keep the exact feasible argmin/argmax indices as internal metadata."""
-    x = interval(x)
-    axis, = axes
-    lower = jnp.moveaxis(x.lower, axis, -1)
-    upper = jnp.moveaxis(x.upper, axis, -1)
+def _argminmax_candidate_mask(lower, upper, *, axis, is_min):
+    """Return feasible extrema indices, including first-index tie semantics."""
+    lower = jnp.moveaxis(lower, axis, -1)
+    upper = jnp.moveaxis(upper, axis, -1)
     size = lower.shape[-1]
     reduction_axis = lower.ndim - 1
 
@@ -284,11 +282,22 @@ def _inclusion_argminmax_p(x, *, axes, index_dtype, is_min):
         )
 
     candidate_mask = jnp.logical_and(earlier_feasible, later_feasible)
-    if jnp.issubdtype(x.dtype, jnp.inexact):
+    if jnp.issubdtype(lower.dtype, jnp.inexact):
         # NaN endpoint semantics are not meaningful interval bounds.  Retain
         # soundness by considering every index possible for such a slice.
         has_nan = jnp.any(jnp.isnan(lower) | jnp.isnan(upper), axis=-1)
         candidate_mask = jnp.where(has_nan[..., None], True, candidate_mask)
+    return candidate_mask
+
+
+def _inclusion_argminmax_p(x, *, axes, index_dtype, is_min):
+    """Keep the exact feasible argmin/argmax indices as internal metadata."""
+    x = interval(x)
+    axis, = axes
+    candidate_mask = _argminmax_candidate_mask(
+        x.lower, x.upper, axis=axis, is_min=is_min
+    )
+    size = candidate_mask.shape[-1]
 
     values = jnp.broadcast_to(
         jnp.arange(size, dtype=index_dtype), candidate_mask.shape
@@ -406,6 +415,91 @@ def _inclusion_gather_p(operand, start_indices, **kwargs):
     return _with_discrete_enclosure(out, lower, upper, mask, discrete.source)
 
 
+def _inclusion_scatter_p(operand, scatter_indices, updates, **kwargs):
+    """Propagate retained finite index choices through replacement scatter."""
+    operand = interval(operand)
+    updates = interval(updates)
+    discrete = _discrete_enclosure(scatter_indices)
+    if discrete is None:
+        return _make_inclusion_passthrough_p(lax.scatter_p)(
+            operand, scatter_indices, updates, **kwargs
+        )
+
+    scenario_count = discrete.lower.shape[-1]
+    operand_scenarios = _scenario_bounds(
+        operand, discrete.source, scenario_count
+    )
+    update_scenarios = _scenario_bounds(
+        updates, discrete.source, scenario_count
+    )
+
+    def drop_unmatched_correlation(value):
+        # A different discrete source has no justified scenario pairing with
+        # the scatter index.  Reuse its already-sound public hull in every
+        # index scenario, which represents the Cartesian product rather than
+        # independently scattering unrelated lower and upper endpoints.
+        mask = jnp.ones(
+            value.shape + (scenario_count,), dtype=jnp.bool_
+        )
+        return value.lower[..., None], value.upper[..., None], mask
+
+    if operand_scenarios is None:
+        operand_scenarios = drop_unmatched_correlation(operand)
+    if update_scenarios is None:
+        update_scenarios = drop_unmatched_correlation(updates)
+
+    operand_lower, operand_upper, operand_mask = operand_scenarios
+    update_lower, update_upper, update_mask = update_scenarios
+    operand_lower = jnp.broadcast_to(
+        operand_lower, operand.shape + (scenario_count,)
+    )
+    operand_upper = jnp.broadcast_to(
+        operand_upper, operand.shape + (scenario_count,)
+    )
+    update_lower = jnp.broadcast_to(
+        update_lower, updates.shape + (scenario_count,)
+    )
+    update_upper = jnp.broadcast_to(
+        update_upper, updates.shape + (scenario_count,)
+    )
+
+    def scatter_one(values, indices, replacements):
+        return lax.scatter_p.bind(values, indices, replacements, **kwargs)
+
+    lower = jnp.moveaxis(
+        jax.vmap(scatter_one)(
+            jnp.moveaxis(operand_lower, -1, 0),
+            jnp.moveaxis(discrete.lower, -1, 0),
+            jnp.moveaxis(update_lower, -1, 0),
+        ),
+        0,
+        -1,
+    )
+    upper = jnp.moveaxis(
+        jax.vmap(scatter_one)(
+            jnp.moveaxis(operand_upper, -1, 0),
+            jnp.moveaxis(discrete.upper, -1, 0),
+            jnp.moveaxis(update_upper, -1, 0),
+        ),
+        0,
+        -1,
+    )
+
+    def scenario_active(mask):
+        if mask.ndim == 1:
+            return mask
+        return jnp.all(mask, axis=tuple(range(mask.ndim - 1)))
+
+    active = scenario_active(discrete.mask)
+    active = jnp.logical_and(active, scenario_active(operand_mask))
+    active = jnp.logical_and(active, scenario_active(update_mask))
+    mask = jnp.broadcast_to(active, lower.shape)
+    out = Interval(lower[..., 0], upper[..., 0])
+    return _with_discrete_enclosure(
+        out, lower, upper, mask, discrete.source
+    )
+
+
 # We would like to passthrough array operations like reshaping, slicing, etc.
 _add_passthrough_to_registry(lax.copy_p)
 _add_passthrough_to_registry(lax.reshape_p)
@@ -453,6 +547,7 @@ inclusion_registry[lax.argmax_p] = _inclusion_argmax_p
 inclusion_registry[lax.broadcast_in_dim_p] = _inclusion_broadcast_in_dim_p
 inclusion_registry[lax.dynamic_slice_p] = _inclusion_dynamic_slice_p
 inclusion_registry[lax.gather_p] = _inclusion_gather_p
+inclusion_registry[lax.scatter_p] = _inclusion_scatter_p
 
 """
 TODO: Handle higher order primitives

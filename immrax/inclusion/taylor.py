@@ -1964,8 +1964,10 @@ def _is_abstract(value):
     return isinstance(value, (TaylorModel, Interval))
 
 
-def taylor_jaxpr(jaxpr, consts, *args) -> list[Any]:
-    """Evaluate one Jaxpr using the deliberately small Taylor registry.
+def interpret_inclusion_jaxpr(
+    jaxpr, consts, *args, registry, is_abstract, label, on_rule=None
+) -> list[Any]:
+    """Evaluate the live output slice with an explicit inclusion registry.
 
     Pure equations outside the backward slice of the requested outputs are
     skipped.  Effectful equations are retained.  This matters for MuJoDiCo,
@@ -2014,14 +2016,16 @@ def taylor_jaxpr(jaxpr, consts, *args) -> list[Any]:
             continue
         subfuns, bind_params = equation.primitive.get_bind_params(equation.params)
         inputs = [read(variable) for variable in equation.invars]
-        if any(_is_abstract(value) for value in inputs):
+        if any(is_abstract(value) for value in inputs):
             try:
-                rule = taylor_inclusion_registry[equation.primitive]
+                rule = registry[equation.primitive]
             except KeyError as error:
                 raise NotImplementedError(
-                    "experimental Taylor primitive unsupported: "
+                    f"experimental {label} primitive unsupported: "
                     f"{equation.primitive.name}"
                 ) from error
+            if on_rule is not None:
+                on_rule(equation.primitive)
             answer = rule(*subfuns, *inputs, **bind_params)
         else:
             answer = equation.primitive.bind(*subfuns, *inputs, **bind_params)
@@ -2031,6 +2035,17 @@ def taylor_jaxpr(jaxpr, consts, *args) -> list[Any]:
         else:
             write(equation.outvars[0], answer)
     return [read(variable) for variable in jaxpr.outvars]
+
+
+def taylor_jaxpr(jaxpr, consts, *args) -> list[Any]:
+    """Evaluate one Jaxpr using the deliberately small Taylor registry."""
+
+    return interpret_inclusion_jaxpr(
+        jaxpr, consts, *args,
+        registry=taylor_inclusion_registry,
+        is_abstract=_is_abstract,
+        label="Taylor",
+    )
 
 
 def tmif(function: Callable[..., Any]) -> Callable[..., Any]:

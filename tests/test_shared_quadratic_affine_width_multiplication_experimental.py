@@ -24,9 +24,12 @@ import numpy as np
 
 from immrax.inclusion.interval import Interval
 from immrax.inclusion.taylor import (
+    QuadraticEndpointPair,
     TaylorModel,
     evaluate_polynomial,
+    nonnegative_endpoint_product,
     polynomial_range,
+    taylor_endpoint_models,
     taylor_range,
 )
 
@@ -792,3 +795,314 @@ def test_affine_width_capture_against_taylor_remainder():
         )
     )
     print("\n\n" + "\n".join(summary))
+
+
+# The following comparison uses the same original input fibers for all four
+# methods.  These helpers remain test-local; no arithmetic is registered.
+def _pair_from_shared(bound: SharedQuadraticBound):
+    return _endpoint_models(bound)
+
+
+def _pair_range(pair):
+    return Interval(
+        polynomial_range(pair[0]).lower,
+        polynomial_range(pair[1]).upper,
+    )
+
+
+def _assert_nonnegative_pair(pair):
+    lower, upper = pair
+    assert float(polynomial_range(upper - lower).lower) >= -_TOLERANCE
+    assert float(polynomial_range(lower).lower) >= -_TOLERANCE
+    assert all(
+        bool(jnp.all(jnp.isfinite(leaf)))
+        for model in pair
+        for leaf in jax.tree.leaves(model)
+    )
+
+
+def _pair_to_taylor(pair):
+    lower, upper = pair
+    midpoint = 0.5 * (lower + upper)
+    half_width = 0.5 * (upper - lower)
+    half_range = polynomial_range(half_width)
+    radius = jnp.maximum(jnp.abs(half_range.lower), jnp.abs(half_range.upper))
+    return _model(
+        midpoint.constant, midpoint.linear, midpoint.quadratic, (-radius, radius)
+    )
+
+
+def _pair_to_shared(pair):
+    """Enclose a quadratic half-width by an affine upper function.
+
+    D = d0 + d1 @ xi + q(xi) <= d0 + d1 @ xi + max(q).  The
+    quadratic-only range is analytic, not a sampled fit.  For an ordered
+    pair D >= 0, so the enclosing affine half-width is also nonnegative.
+    """
+
+    lower, upper = pair
+    midpoint = 0.5 * (lower + upper)
+    half_width = 0.5 * (upper - lower)
+    quadratic_only = _model(
+        0.0, jnp.zeros_like(half_width.linear), half_width.quadratic
+    )
+    affine_upper_constant = (
+        half_width.constant + polynomial_range(quadratic_only).upper
+    )
+    return _symmetric_bound(
+        midpoint, affine_upper_constant, half_width.linear
+    )
+
+
+def _interval_overflow_pair(first, second):
+    """Generic O(n^2) Taylor overflow on each needed endpoint product."""
+
+    lower, _ = taylor_endpoint_models(first[0] * second[0])
+    _, upper = taylor_endpoint_models(first[1] * second[1])
+    return lower, upper
+
+
+def _am_gm_pair(first, second):
+    output = nonnegative_endpoint_product(
+        QuadraticEndpointPair(*first, jnp.asarray(True)),
+        QuadraticEndpointPair(*second, jnp.asarray(True)),
+    )
+    return output
+
+
+def _fiber_metrics(representation, sources, reference, kind):
+    if kind == "pair":
+        fibers = _evaluate_pair(representation, sources)
+        global_range = _pair_range(representation)
+    elif kind == "shared":
+        fibers = _evaluate_bound(representation, sources)
+        global_range = _bound_range(representation)
+    else:
+        fibers = _evaluate_taylor(representation, sources)
+        global_range = taylor_range(representation)
+    widths = fibers[:, 1] - fibers[:, 0]
+    exact_widths = reference[:, 1] - reference[:, 0]
+    lower_margin = reference[:, 0] - fibers[:, 0]
+    upper_margin = fibers[:, 1] - reference[:, 1]
+    result = dict(
+        lower=float(global_range.lower),
+        upper=float(global_range.upper),
+        global_width=float(global_range.width),
+        mean_width=float(np.mean(widths)),
+        max_width=float(np.max(widths)),
+        mean_excess=float(np.mean(widths - exact_widths)),
+        max_excess=float(np.max(widths - exact_widths)),
+        min_lower_margin=float(np.min(lower_margin)),
+        min_upper_margin=float(np.min(upper_margin)),
+    )
+    assert np.all(np.isfinite(list(result.values())))
+    assert result["min_lower_margin"] >= -_TOLERANCE
+    assert result["min_upper_margin"] >= -_TOLERANCE
+    return result
+
+
+def _evaluate_pair(pair, sources):
+    return np.column_stack(
+        tuple(
+            np.asarray(jax.vmap(lambda z: evaluate_polynomial(model, z))(sources))
+            for model in pair
+        )
+    )
+
+
+def _original_product_fibers(first, second, sources):
+    x = _evaluate_pair(first, sources)
+    y = _evaluate_pair(second, sources)
+    corners = np.stack(
+        (x[:, 0] * y[:, 0], x[:, 0] * y[:, 1],
+         x[:, 1] * y[:, 0], x[:, 1] * y[:, 1]), axis=1
+    )
+    return np.column_stack((corners.min(axis=1), corners.max(axis=1)))
+
+
+def _positive_midpoint(rng, n, random):
+    if random:
+        linear = rng.normal(scale=0.13, size=n)
+        raw = rng.normal(scale=0.07, size=(n, n))
+        quadratic = 0.5 * (raw + raw.T)
+    else:
+        linear = np.resize([0.22, -0.17, 0.11], n)
+        quadratic = np.diag(np.resize([0.12, -0.08, 0.06], n))
+    return _model(0.0, linear, quadratic)
+
+
+def _comparison_input(family, rng, n, random, second):
+    midpoint = _positive_midpoint(rng, n, random)
+    if second:
+        midpoint = _model(
+            midpoint.constant,
+            -0.8 * midpoint.linear,
+            -0.6 * midpoint.quadratic,
+        )
+    if family == "Taylor":
+        low, high = (-0.07, 0.11) if not random else (
+            -rng.uniform(0.03, 0.10), rng.uniform(0.04, 0.12)
+        )
+        provisional = _model(0.0, midpoint.linear, midpoint.quadratic, (low, high))
+        shift = 0.4 - float(taylor_range(provisional).lower)
+        original_taylor = _model(
+            shift, midpoint.linear, midpoint.quadratic, (low, high)
+        )
+        original_pair = taylor_endpoint_models(original_taylor)
+        shared = _symmetric_bound(
+            _model(shift + 0.5 * (low + high), midpoint.linear, midpoint.quadratic),
+            0.5 * (high - low),
+            np.zeros(n),
+        )
+        return original_pair, shared, original_taylor
+    if family == "Shared":
+        affine = (rng.normal(scale=0.02, size=n) if random
+                  else np.resize([0.025, -0.018, 0.012], n))
+        width_constant = np.sum(np.abs(affine)) + 0.045
+        shared = _symmetric_bound(midpoint, width_constant, affine)
+        shift = 0.4 - float(_bound_range(shared).lower)
+        shared = _shift_bound(shared, shift)
+        original_pair = _pair_from_shared(shared)
+        return original_pair, shared, _bound_to_taylor(shared)
+    # Full-pair half-width has a genuinely nonzero quadratic matrix.
+    affine = (rng.normal(scale=0.012, size=n) if random
+              else np.resize([0.012, -0.008, 0.006], n))
+    diagonal = (rng.uniform(0.025, 0.065, size=n) if random
+                else np.resize([0.05, 0.035, 0.04], n))
+    half_width = _model(
+        np.sum(np.abs(affine)) + 0.035,
+        affine,
+        np.diag(2.0 * diagonal),
+    )
+    provisional_lower = midpoint - half_width
+    shift = 0.4 - float(polynomial_range(provisional_lower).lower)
+    shifted_midpoint = midpoint + shift
+    original_pair = (shifted_midpoint - half_width,
+                     shifted_midpoint + half_width)
+    return original_pair, _pair_to_shared(original_pair), _pair_to_taylor(original_pair)
+
+
+def _format_comparison_row(name, result, baseline):
+    return (
+        f"{name}: [{result['lower']:.5f},{result['upper']:.5f}] "
+        f"W={result['global_width']:.5f} "
+        f"fiber={result['mean_width']:.5f}/{result['max_width']:.5f} "
+        f"excess={result['mean_excess']:.5f}/{result['max_excess']:.5f} "
+        f"margins={result['min_lower_margin']:.2e}/"
+        f"{result['min_upper_margin']:.2e} "
+        f"ratio(T)={result['global_width']/baseline['global_width']:.3f}/"
+        f"{result['mean_width']/baseline['mean_width']:.3f}"
+    )
+
+
+def test_aligned_nonnegative_three_representation_multiplication():
+    """Compare four separate rules on identical original product fibers."""
+
+    rng = np.random.default_rng(20260930)
+    counts = {name: {key: {outcome: 0 for outcome in ('win', 'loss', 'tie')}
+                     for key in ('global_width', 'mean_width')}
+              for name in ('Shared', 'O(n^2) pair', 'AM-GM pair')}
+    pair_counts = {key: {outcome: 0 for outcome in ('win', 'loss', 'tie')}
+                   for key in ('global_width', 'mean_width')}
+    lines = []
+    for n in (2, 3):
+        sources = np.concatenate(
+            (np.array(list(itertools.product((-1.0, 1.0), repeat=n))),
+             rng.uniform(-1.0, 1.0, size=(65, n))), axis=0
+        )
+        for family in ('Taylor', 'Shared', 'Full pair'):
+            for random in (False, True):
+                first = _comparison_input(family, rng, n, random, False)
+                second = _comparison_input(family, rng, n, random, True)
+                original = (first[0], second[0])
+                for pair in original:
+                    _assert_nonnegative_pair(pair)
+                reference = _original_product_fibers(*original, sources)
+                inputs = {
+                    'original': original,
+                    'shared': (first[1], second[1]),
+                    'Taylor': (first[2], second[2]),
+                }
+                lines.append(f"n={n} {family} {'random' if random else 'control'}")
+                for index in (0, 1):
+                    baseline_input = _fiber_metrics(
+                        inputs['original'][index], sources,
+                        _evaluate_pair(inputs['original'][index], sources), 'pair'
+                    )
+                    details = []
+                    for label, kind in (('original', 'pair'),
+                                        ('shared', 'shared'), ('Taylor', 'Taylor')):
+                        measure = _fiber_metrics(
+                            inputs[label][index], sources,
+                            _evaluate_pair(inputs['original'][index], sources), kind
+                        )
+                        details.append(
+                            f"{label} W={measure['global_width']:.5f} "
+                            f"fiber={measure['mean_width']:.5f} "
+                            f"added={measure['global_width']-baseline_input['global_width']:.5f}/"
+                            f"{measure['mean_width']-baseline_input['mean_width']:.5f}"
+                        )
+                    lines.append(f"  input {index+1}: " + '; '.join(details))
+                am_gm = _am_gm_pair(*original)
+                assert bool(am_gm.preconditions_hold)
+                output = {
+                    'Taylor': (inputs['Taylor'][0] * inputs['Taylor'][1], 'Taylor'),
+                    'Shared': (_retained_core_product(*inputs['shared']), 'shared'),
+                    'O(n^2) pair': (_interval_overflow_pair(*original), 'pair'),
+                    'AM-GM pair': ((am_gm.lower, am_gm.upper), 'pair'),
+                }
+                measures = {
+                    name: _fiber_metrics(value, sources, reference, kind)
+                    for name, (value, kind) in output.items()
+                }
+                baseline = measures['Taylor']
+                for name, result in measures.items():
+                    lines.append('  ' + _format_comparison_row(name, result, baseline))
+                    if name != 'Taylor':
+                        for key in ('global_width', 'mean_width'):
+                            counts[name][key][_outcome(result, baseline, key)] += 1
+                for key in ('global_width', 'mean_width'):
+                    pair_counts[key][_outcome(
+                        measures['O(n^2) pair'], measures['AM-GM pair'], key
+                    )] += 1
+                for name in ('O(n^2) pair', 'AM-GM pair'):
+                    converted = _fiber_metrics(
+                        _pair_to_taylor(output[name][0]), sources, reference, 'Taylor'
+                    )
+                    raw = measures[name]
+                    lines.append(
+                        f"  {name} -> Taylor conversion added "
+                        f"W={converted['global_width']-raw['global_width']:.5f} "
+                        f"fiber={converted['mean_width']-raw['mean_width']:.5f}"
+                    )
+                lines.append(
+                    f"  O(n^2)-minus-AM-GM raw W="
+                    f"{measures['O(n^2) pair']['global_width']-measures['AM-GM pair']['global_width']:.5f} "
+                    f"fiber={measures['O(n^2) pair']['mean_width']-measures['AM-GM pair']['mean_width']:.5f}"
+                )
+    for name, comparisons in counts.items():
+        for key, outcomes in comparisons.items():
+            lines.append(f"{name} vs Taylor {key} W/L/T: "
+                         f"{outcomes['win']}/{outcomes['loss']}/{outcomes['tie']}")
+    for key, outcomes in pair_counts.items():
+        lines.append(f"O(n^2) vs AM-GM {key} W/L/T: "
+                     f"{outcomes['win']}/{outcomes['loss']}/{outcomes['tie']}")
+    lines.append('Sampling checks containment and tightness, not continuous soundness.')
+    print('\n' + '\n'.join(lines))
+
+
+def test_interval_overflow_pair_jit_shape_smoke():
+    rng = np.random.default_rng(20260930)
+    first = _comparison_input('Full pair', rng, 8, True, False)[0]
+    second = _comparison_input('Full pair', rng, 8, True, True)[0]
+    for pair in (first, second):
+        _assert_nonnegative_pair(pair)
+    eager = _interval_overflow_pair(first, second)
+    compiled = jax.jit(_interval_overflow_pair)(first, second)
+    for expected, observed in zip(eager, compiled):
+        for expected_leaf, observed_leaf in zip(
+            jax.tree.leaves(expected), jax.tree.leaves(observed)
+        ):
+            np.testing.assert_allclose(observed_leaf, expected_leaf, atol=1e-12)
+    assert eager[0].quadratic.shape == (8, 8)
+    assert eager[1].quadratic.shape == (8, 8)

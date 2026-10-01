@@ -4,6 +4,8 @@ A PairedQuadratic represents [L2(xi), U2(xi)] on one shared normalized
 source box. L2 and U2 are degree-2 endpoint polynomials stored as zero-
 remainder TaylorModel containers. The concrete value lies between their
 values at *every fixed* xi. This module is opt-in and leaves tmif unchanged.
+Pair multiplication defaults to the native midpoint/half-width rule;
+``four_candidate`` and the legacy ``taylor`` strategy remain explicit options.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from .taylor import (
     TaylorModel,
     _model_is_finite,
     _nan_model_like,
+    _square as _taylor_square,
     _where_model,
     constant_taylor_model,
     evaluate_polynomial,
@@ -304,6 +307,125 @@ def _nonnegative_product(x: PairedQuadratic, y: PairedQuadratic):
     return PairedQuadratic(lower, upper, x.valid & y.valid)
 
 
+def _product_polynomials(first: TaylorModel, second: TaylorModel):
+    """Degree-2 product and interval overflow from Taylor's fixed-rank kernel."""
+    return taylor_endpoint_models(first * second)
+
+
+def _square_polynomial(model: TaylorModel):
+    """Dependency-aware quadratic square, including interval square of q²."""
+    return taylor_endpoint_models(_taylor_square(model))
+
+
+def _native_input_valid(x: PairedQuadratic, y: PairedQuadratic | None = None):
+    status = pair_status(x)
+    valid = x.valid & status["zero_remainder"] & status["ordered"] & status["finite"]
+    if y is not None:
+        other = pair_status(y)
+        valid = valid & y.valid & other["zero_remainder"] & other["ordered"] & other["finite"]
+    return valid
+
+
+def _finish_native(lower: TaylorModel, upper: TaylorModel, valid):
+    # The analytic envelope proves pointwise order. The range-based shift
+    # gives the representation its sufficient termwise order certificate.
+    result = certify_pair_order(PairedQuadratic(lower, upper, valid))
+    return _select(valid, result, PairedQuadratic(
+        _nan_model_like(lower), _nan_model_like(upper), False,
+    ))
+
+
+def _reference_hull(lowers, uppers):
+    """Constant reference shifts for a fixed small candidate arity."""
+    lower_choices = []
+    upper_choices = []
+    for reference in lowers:  # Four product corners or two square endpoints.
+        shift = jnp.max(jnp.stack([
+            jnp.maximum(polynomial_range(reference - other).upper, 0.0)
+            for other in lowers
+        ]), axis=0)
+        lower_choices.append(reference - shift)
+    for reference in uppers:
+        shift = jnp.max(jnp.stack([
+            jnp.maximum(polynomial_range(other - reference).upper, 0.0)
+            for other in uppers
+        ]), axis=0)
+        upper_choices.append(reference + shift)
+    lower_scores = jnp.stack([polynomial_range(x).lower for x in lower_choices])
+    upper_scores = jnp.stack([polynomial_range(x).upper for x in upper_choices])
+    lower_index = jnp.argmax(lower_scores, axis=0)
+    upper_index = jnp.argmin(upper_scores, axis=0)
+    lower, upper = lower_choices[0], upper_choices[0]
+    for index in range(1, len(lower_choices)):
+        lower = _where_model(lower_index == index, lower_choices[index], lower)
+        upper = _where_model(upper_index == index, upper_choices[index], upper)
+    return lower, upper
+
+
+def _four_candidate_product(x: PairedQuadratic, y: PairedQuadratic):
+    products = (
+        _product_polynomials(x.lower, y.lower),
+        _product_polynomials(x.lower, y.upper),
+        _product_polynomials(x.upper, y.lower),
+        _product_polynomials(x.upper, y.upper),
+    )
+    general_lower, general_upper = _reference_hull(
+        tuple(product[0] for product in products),
+        tuple(product[1] for product in products),
+    )
+    x_positive = polynomial_range(x.lower).lower >= 0
+    x_negative = polynomial_range(x.upper).upper <= 0
+    y_positive = polynomial_range(y.lower).lower >= 0
+    y_negative = polynomial_range(y.upper).upper <= 0
+    lower, upper = general_lower, general_upper
+    # The four sign cases select exact interval-product corners before the
+    # degree-2 overflow enclosure. Branches have fixed arity independent of n.
+    for gate, low_index, high_index in (
+        (x_positive & y_positive, 0, 3),
+        (x_negative & y_negative, 3, 0),
+        (x_positive & y_negative, 2, 1),
+        (x_negative & y_positive, 1, 2),
+    ):
+        lower = _where_model(gate, products[low_index][0], lower)
+        upper = _where_model(gate, products[high_index][1], upper)
+    fixed_sign = ((x_positive & y_positive) | (x_negative & y_negative)
+                  | (x_positive & y_negative) | (x_negative & y_positive))
+    _record(lax.mul_p, "native four-candidate fixed-sign", fixed_sign)
+    return _finish_native(lower, upper, _native_input_valid(x, y))
+
+
+def _midpoint_product(x: PairedQuadratic, y: PairedQuadratic):
+    mx, dx = 0.5 * (x.lower + x.upper), 0.5 * (x.upper - x.lower)
+    my, dy = 0.5 * (y.lower + y.upper), 0.5 * (y.upper - y.lower)
+    rx, ry = polynomial_range(mx), polynomial_range(my)
+    mux = jnp.maximum(jnp.abs(rx.lower), jnp.abs(rx.upper))
+    muy = jnp.maximum(jnp.abs(ry.lower), jnp.abs(ry.upper))
+    center_lower, center_upper = _product_polynomials(mx, my)
+    _, width_upper = _product_polynomials(dx, dy)
+    width = mux * dy + muy * dx + width_upper
+    _record(lax.mul_p, "native midpoint", None)
+    return _finish_native(center_lower - width, center_upper + width,
+                          _native_input_valid(x, y))
+
+
+def _square_pair(x: PairedQuadratic):
+    lower_square = _square_polynomial(x.lower)
+    upper_square = _square_polynomial(x.upper)
+    positive = polynomial_range(x.lower).lower >= 0
+    negative = polynomial_range(x.upper).upper <= 0
+    _, crossing_upper = _reference_hull(
+        (lower_square[0], upper_square[0]),
+        (lower_square[1], upper_square[1]),
+    )
+    zero = constant_taylor_model(jnp.zeros_like(x.lower.constant), x.source_size)
+    lower = _where_model(positive, lower_square[0],
+                         _where_model(negative, upper_square[0], zero))
+    upper = _where_model(positive, upper_square[1],
+                         _where_model(negative, lower_square[1], crossing_upper))
+    _record(lax.integer_pow_p, "native square", None)
+    return _finish_native(lower, upper, _native_input_valid(x))
+
+
 def _fallback(primitive, *args, **params):
     if primitive not in _allowed_fallback_primitives:
         raise NotImplementedError(
@@ -333,7 +455,7 @@ def register_pair_taylor_fallback(primitive):
     _allowed_fallback_primitives.add(primitive)
 
 
-def _mul(x, y):
+def _mul(x, y, *, multiplication_strategy="midpoint"):
     if (isinstance(x, PairedQuadratic) or isinstance(y, PairedQuadratic)) and (
         isinstance(x, Interval) or isinstance(y, Interval)
     ):
@@ -347,6 +469,10 @@ def _mul(x, y):
     if isinstance(y, PairedQuadratic) and not isinstance(x, PairedQuadratic):
         return _scale(y, x)
     x, y = _promote(x, y), _promote(y, x)
+    if multiplication_strategy == "four_candidate":
+        return _four_candidate_product(x, y)
+    if multiplication_strategy == "midpoint":
+        return _midpoint_product(x, y)
     x_status, y_status = pair_status(x), pair_status(y)
     nonnegative = (
         x.valid & y.valid
@@ -458,7 +584,7 @@ def _moveaxis(x: PairedQuadratic, source, destination):
     )
 
 
-def _dot_general(a, b, **params):
+def _dot_general(a, b, *, multiplication_strategy="midpoint", **params):
     if (isinstance(a, PairedQuadratic) or isinstance(b, PairedQuadratic)) and (
         isinstance(a, Interval) or isinstance(b, Interval)
     ):
@@ -475,7 +601,7 @@ def _dot_general(a, b, **params):
     b_free = b.shape[batch_n + contract_n:]
     a = a.reshape(a.shape + (1,) * len(b_free))
     b = b.reshape(b.shape[:batch_n + contract_n] + (1,) * len(a_free) + b_free)
-    products = _mul(a, b)
+    products = _mul(a, b, multiplication_strategy=multiplication_strategy)
     axes = tuple(range(batch_n, batch_n + contract_n))
     return _reduce_sum(products, axes=axes) if axes else products
 
@@ -585,6 +711,7 @@ if hasattr(lax, "split_p"):
 
 _allowed_fallback_primitives: set[Any] = {
     lax.add_p, lax.mul_p, lax.div_p, lax.dot_general_p,
+    lax.integer_pow_p,
     lax.concatenate_p, lax.select_n_p, lax.scatter_p, lax.scatter_add_p,
 }
 _fallback_primitives: set[Any] = set()
@@ -597,11 +724,20 @@ def register_pair_rule(primitive, rule: Callable[..., Any]):
     pair_inclusion_registry[primitive] = rule
 
 
-def _pair_jit_rule(*args, **params):
+def _pair_jit_rule(*args, multiplication_strategy="midpoint", **params):
     closed = params.pop("jaxpr")
     if isinstance(closed, jax.extend.core.ClosedJaxpr):
-        return pair_jaxpr(closed.jaxpr, closed.consts, *args)
-    return pair_jaxpr(closed, [], *args)
+        return pair_jaxpr(closed.jaxpr, closed.consts, *args,
+                          multiplication_strategy=multiplication_strategy)
+    return pair_jaxpr(closed, [], *args, multiplication_strategy=multiplication_strategy)
+
+
+def _integer_square(x, *, y, multiplication_strategy):
+    if y != 2:
+        raise NotImplementedError("paired integer_pow only supports square (y=2)")
+    if multiplication_strategy == "taylor" or not isinstance(x, PairedQuadratic):
+        return _fallback(lax.integer_pow_p, x, y=y)
+    return _square_pair(x)
 
 try:
     pair_inclusion_registry[jax._src.pjit.jit_p] = _pair_jit_rule
@@ -613,19 +749,43 @@ def _is_abstract(value):
     return isinstance(value, (PairedQuadratic, Interval))
 
 
-def pair_jaxpr(jaxpr, consts, *args):
+def pair_jaxpr(jaxpr, consts, *args, multiplication_strategy="midpoint"):
     audit = _active_audit.get()
+    registry = dict(pair_inclusion_registry)
+    registry[lax.mul_p] = lambda x, y: _mul(
+        x, y, multiplication_strategy=multiplication_strategy,
+    )
+    registry[lax.dot_general_p] = lambda x, y, **p: _dot_general(
+        x, y, multiplication_strategy=multiplication_strategy, **p,
+    )
+    registry[lax.integer_pow_p] = lambda x, *, y: _integer_square(
+        x, y=y, multiplication_strategy=multiplication_strategy,
+    )
+    try:
+        registry[jax._src.pjit.jit_p] = lambda *values, **p: _pair_jit_rule(
+            *values, multiplication_strategy=multiplication_strategy, **p,
+        )
+    except AttributeError:  # pragma: no cover
+        pass
     return interpret_inclusion_jaxpr(
         jaxpr, consts, *args,
-        registry=pair_inclusion_registry,
+        registry=registry,
         is_abstract=_is_abstract,
         label="paired quadratic",
         on_rule=(lambda primitive: audit.add(primitive, "Taylor fallback" if primitive in _fallback_primitives else "native")) if audit is not None else None,
     )
 
 
-def pqif(function: Callable[..., Any]) -> Callable[..., Any]:
-    """Transform a point function through ordered quadratic endpoint pairs."""
+def pqif(function: Callable[..., Any], *, multiplication_strategy="midpoint") -> Callable[..., Any]:
+    """Transform a point function through ordered quadratic endpoint pairs.
+
+    ``multiplication_strategy`` is fixed before tracing. The default uses the
+    pair-native midpoint/half-width rule. The original pair-to-Taylor rule and
+    the tighter four-candidate rule remain explicit alternatives.
+    """
+
+    if multiplication_strategy not in ("taylor", "four_candidate", "midpoint"):
+        raise ValueError(f"unknown paired multiplication strategy: {multiplication_strategy}")
 
     @wraps(function)
     def wrapped(*args, audit: PairAudit | None = None, **kwargs):
@@ -648,7 +808,10 @@ def pqif(function: Callable[..., Any]) -> Callable[..., Any]:
         flat_args = [x for x in leaves if isinstance(x, PairedQuadratic) or eqx.is_array(x)]
         token = _active_audit.set(audit)
         try:
-            outputs = pair_jaxpr(closed.jaxpr, closed.literals, *flat_args)
+            outputs = pair_jaxpr(
+                closed.jaxpr, closed.literals, *flat_args,
+                multiplication_strategy=multiplication_strategy,
+            )
         finally:
             _active_audit.reset(token)
         return outputs[0] if len(outputs) == 1 else outputs

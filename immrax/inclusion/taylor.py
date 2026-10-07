@@ -1060,6 +1060,17 @@ def _pow(x, y):
 
 
 def _integer_pow(x, *, y):
+    """Taylor ``integer_pow`` for exponents ``0, 1, 2`` and ``-2``.
+
+    ``y = -2`` reuses the centered ``"power"`` rule with ``f(u) = u^-2``,
+    ``f'(u) = -2 u^-3``, ``f''(u) = 6 u^-4``, ``f'''(u) = -24 u^-5``.  The
+    Lagrange derivative is enclosed over the whole segment between the
+    expansion point and the represented range, and the regular Taylor
+    candidate is used only when that segment is certified strictly positive.
+    A strictly positive range with a nonfinite expansion falls back to the
+    interval ``[upper^-2, lower^-2]``.  Any range touching or crossing zero
+    (and, conservatively, an entirely negative range) returns top.
+    """
     if not isinstance(x, TaylorModel):
         return lax.integer_pow_p.bind(x, y=y)
     if y == 0:
@@ -1068,8 +1079,10 @@ def _integer_pow(x, *, y):
         return x
     if y == 2:
         return _square(x)
+    if y == -2:
+        return _unary_second_order(x, "power", exponent=-2)
     raise NotImplementedError(
-        f"experimental Taylor integer_pow only supports 0, 1, 2; got {y}"
+        f"experimental Taylor integer_pow only supports 0, 1, 2, -2; got {y}"
     )
 
 

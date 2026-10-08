@@ -1068,8 +1068,16 @@ def _integer_pow(x, *, y):
     expansion point and the represented range, and the regular Taylor
     candidate is used only when that segment is certified strictly positive.
     A strictly positive range with a nonfinite expansion falls back to the
-    interval ``[upper^-2, lower^-2]``.  Any range touching or crossing zero
-    (and, conservatively, an entirely negative range) returns top.
+    interval ``[upper^-2, lower^-2]``.
+
+    A strictly negative represented range (``taylor_range(x).upper < 0``)
+    uses the even-power reflection ``u^-2 = (-u)^-2``: the exact negation
+    ``-x`` represents, at every source, exactly the negated values of ``x``,
+    and its range is strictly positive, so the positive-domain enclosure of
+    ``(-x)^-2`` contains ``u^-2`` for every represented value ``u``.  If the
+    reflected expansion point lies outside the positive segment, that rule's
+    finite interval fallback applies.  Any range touching or crossing zero
+    returns top.  The positive route is selected elementwise and unchanged.
     """
     if not isinstance(x, TaylorModel):
         return lax.integer_pow_p.bind(x, y=y)
@@ -1080,7 +1088,10 @@ def _integer_pow(x, *, y):
     if y == 2:
         return _square(x)
     if y == -2:
-        return _unary_second_order(x, "power", exponent=-2)
+        direct = _unary_second_order(x, "power", exponent=-2)
+        reflected = _unary_second_order(_neg(x), "power", exponent=-2)
+        strictly_negative = taylor_range(x).upper < 0
+        return _where_model(strictly_negative, reflected, direct)
     raise NotImplementedError(
         f"experimental Taylor integer_pow only supports 0, 1, 2, -2; got {y}"
     )

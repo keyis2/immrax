@@ -1662,9 +1662,48 @@ def _max_or_min(x, y, *, is_max):
 
 
 def _abs(x):
+    """Elementwise ``|x|`` with exact fixed signs and a two-sided secant crossing.
+
+    Let ``x = P(xi) + r`` with ``r`` in the remainder ``R`` and termwise range
+    ``[l, u]``.  If ``l >= 0`` the result is ``x``; if ``u <= 0`` it is
+    ``-x``.  If ``l < 0 < u``, let ``m = (u + l) / (u - l)``; then
+    ``|m| <= 1``, also after rounding, because ``|fl(u + l)| <= fl(u - l)``.
+    The residual ``e(v) = |v| - m v`` is convex with ``e(0) = 0``, so on
+    ``[l, u]`` it satisfies ``0 <= e <= b``, where
+    ``b = max(u - m u, -l - m l)`` is its endpoint maximum.  In exact
+    arithmetic ``b = -2 l u / (u - l)``.  Every represented value therefore
+    has ``|x| = (m P(xi) + b) + m r + (e - b)``.  The result keeps polynomial
+    ``m P + b`` and remainder ``m R + [-b, 0]``.  A crossing entry with a
+    nonfinite range becomes the interval ``[0, inf]``.
+    """
+    if isinstance(x, Interval):
+        straddles = (x.lower < 0) & (x.upper > 0)
+        lower = jnp.where(straddles, 0, jnp.minimum(jnp.abs(x.lower), jnp.abs(x.upper)))
+        return Interval(lower, jnp.maximum(jnp.abs(x.lower), jnp.abs(x.upper)))
     if not isinstance(x, TaylorModel):
         return jnp.abs(x)
-    return _max_or_min(x, -x, is_max=True)
+
+    bounds = taylor_range(x)
+    positive = bounds.lower >= 0
+    negative = bounds.upper <= 0
+    finite_crossing = ~(positive | negative)
+    finite_crossing &= jnp.isfinite(bounds.lower) & jnp.isfinite(bounds.upper)
+    lower = jnp.where(finite_crossing, bounds.lower, -1)
+    upper = jnp.where(finite_crossing, bounds.upper, 1)
+    slope = (upper + lower) / (upper - lower)
+    intercept = jnp.maximum(upper - slope * upper, -lower - slope * lower)
+    scaled = _scale_model(x, slope)
+    secant = _new(
+        scaled.constant + intercept,
+        scaled.linear,
+        scaled.quadratic,
+        Interval(scaled.remainder.lower - intercept, scaled.remainder.upper),
+    )
+    unbounded = _interval_only(
+        jnp.zeros_like(bounds.lower), jnp.full_like(bounds.upper, jnp.inf), x
+    )
+    crossing = _where_model(finite_crossing, secant, unbounded)
+    return _where_model(positive, x, _where_model(negative, _neg(x), crossing))
 
 
 def _apply_unary_value_linear(primitive, x: TaylorModel, **params) -> TaylorModel:

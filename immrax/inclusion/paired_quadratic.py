@@ -151,6 +151,9 @@ def pair_range(value: PairedQuadratic) -> Interval:
     return Interval(polynomial_range(value.lower).lower, polynomial_range(value.upper).upper)
 
 
+_ORDER_ULP_STEPS = 2
+
+
 def certify_pair_order(value: PairedQuadratic) -> PairedQuadratic:
     """Raise the upper endpoint enough for termwise ordering certification.
 
@@ -162,6 +165,13 @@ def certify_pair_order(value: PairedQuadratic) -> PairedQuadratic:
     margin = polynomial_range(value.upper - value.lower).lower
     shift = jnp.maximum(-margin, 0.0)
     upper = value.upper + shift
+    # A shift below half an ULP of the upper constant rounds back to the same
+    # coefficient. Raise that constant outward by whole ULPs until the
+    # recomputed certificate holds; this only widens the pair.
+    for _ in range(_ORDER_ULP_STEPS):
+        residual = polynomial_range(upper - value.lower).lower
+        constant = jnp.where(residual < 0, jnp.nextafter(upper.constant, jnp.inf), upper.constant)
+        upper = TaylorModel(constant, upper.linear, upper.quadratic, upper.remainder)
     return PairedQuadratic(value.lower, upper, value.valid & jnp.isfinite(shift))
 
 

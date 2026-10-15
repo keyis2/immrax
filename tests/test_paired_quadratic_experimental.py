@@ -6,6 +6,7 @@ import numpy as np
 
 from immrax.inclusion import (
     PairedQuadratic,
+    certify_pair_order,
     constant_taylor_model,
     evaluate_pair,
     normalized_pair_seed,
@@ -101,3 +102,36 @@ def test_invalid_order_is_visible_to_conversion():
     bad = PairedQuadratic(good, good - 0.25)
     assert not bool(jnp.all(pair_status(bad)["ordered"]))
     assert bool(jnp.isnan(pair_to_taylor(bad).constant))
+
+
+def test_order_certificate_survives_shift_absorbed_by_rounding():
+    zero = Interval(jnp.array(0.0), jnp.array(0.0))
+
+    def model(constant, linear, quadratic=0.0):
+        n = len(linear)
+        return TaylorModel(jnp.array(constant), jnp.array(linear), jnp.full((n, n), quadratic), zero)
+
+    # The required shift, 2e-17, is below half an ULP of the constant 1.0.
+    lower, upper = model(1.0, [1e-17, 0.0]), model(1.0, [-1e-17, 0.0])
+    certified = certify_pair_order(PairedQuadratic(lower, upper))
+    status = pair_status(certified)
+    assert all(bool(status[k]) for k in ("valid", "finite", "zero_remainder", "ordered"))
+    assert 0 < float(certified.upper.constant - upper.constant) <= 2 * np.spacing(1.0)
+    np.testing.assert_array_equal(certified.lower.constant, lower.constant)
+
+    # The native sqrt of a degenerate pair yields such a sliver through its own order certificate.
+    x = model(4.01e-4, [0.0, 4e-15], 1e-26)
+    root = pqif(jnp.sqrt, operator_strategy="native")(PairedQuadratic(x, x))
+    status = pair_status(root)
+    assert all(bool(status[k]) for k in ("valid", "finite", "zero_remainder", "ordered"))
+    sources = jnp.array([[-1.0, -1.0], [-1.0, 1.0], [0.3, -0.7], [1.0, 1.0], [0.0, 0.0]])
+    for source in sources:
+        value = jnp.sqrt(evaluate_pair(PairedQuadratic(x, x), source)[0])
+        low, high = evaluate_pair(root, source)
+        assert float(low) <= float(value) <= float(high)
+
+    # Genuine failures remain invalid: a negative sqrt domain and a nonfinite order margin.
+    negative = model(-1e-3, [0.0, 4e-15])
+    assert not bool(pqif(jnp.sqrt, operator_strategy="native")(PairedQuadratic(negative, negative)).valid)
+    nan = model(np.nan, [0.0, 0.0])
+    assert not bool(certify_pair_order(PairedQuadratic(nan, nan)).valid)

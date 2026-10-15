@@ -635,11 +635,28 @@ def _max_native(x, y):
         if isinstance(x, Interval) or isinstance(y, Interval):
             return taylor_inclusion_registry[lax.max_p](x, y)
         return lax.max_p.bind(x, y)
+    # max(pair, -inf) = pair exactly. A plain -inf component is neutral and
+    # returns the paired component unchanged; it enters the envelope only as a
+    # finite placeholder, so the global finiteness invariant is untouched.
+    # NaN and +inf components stay in the operand and remain invalid.
+    neutral, pair = None, None
+    if isinstance(x, PairedQuadratic) != isinstance(y, PairedQuadratic):
+        plain_first = not isinstance(x, PairedQuadratic)
+        plain, pair = (x, y) if plain_first else (y, x)
+        if not isinstance(plain, Interval):
+            plain = jnp.asarray(plain)
+            shape = jnp.broadcast_shapes(plain.shape, pair.shape)
+            neutral = jnp.broadcast_to(jnp.isneginf(plain), shape)
+            plain = jnp.where(jnp.isneginf(plain), jnp.zeros_like(plain), plain)
+            x, y = (plain, pair) if plain_first else (pair, plain)
     like = _template(x, y)
     x, y = _promote(x, like), _promote(y, like)
     lower, _ = _max_polynomials(x.lower, y.lower)
     _, upper = _max_polynomials(x.upper, y.upper)
-    return _finish_native(lower, upper, _native_input_valid(x, y))
+    result = _finish_native(lower, upper, _native_input_valid(x, y))
+    if neutral is None:
+        return result
+    return _select(neutral, _broadcast_pair(pair, neutral.shape), result)
 
 
 def _min_native(x, y):

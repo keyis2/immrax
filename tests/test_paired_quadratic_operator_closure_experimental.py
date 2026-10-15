@@ -264,6 +264,32 @@ def test_abs_relu_and_max_min_envelopes():
         np.testing.assert_allclose(a, b, atol=TOL)
 
 
+def _assert_same_pair(actual, expected):
+    for a, b in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+def test_max_min_neutral_infinite_plain_bounds():
+    """Plain -inf in max and +inf in min return the paired component exactly."""
+    x = jax.tree.map(lambda a, b: jnp.stack((a, b)), _pair(shift=-0.2), _pair(shift=0.15))
+    finite = jnp.array([0.0, 0.1])
+    for rule, neutral in ((_max_native, -jnp.inf), (_min_native, jnp.inf)):
+        mixed = jnp.array([neutral, 0.1])
+        for call in (rule, jax.jit(rule)):
+            for out, reference in ((call(x, mixed), rule(x, finite)), (call(mixed, x), rule(finite, x))):
+                _assert_same_pair(out[0], x[0])  # neutral component: coefficients and validity exact
+                for a, b in zip(jax.tree.leaves(out[1]), jax.tree.leaves(reference[1])):
+                    np.testing.assert_allclose(a, b, rtol=0, atol=TOL)  # finite component: existing envelope
+            _assert_same_pair(call(x, jnp.full(2, neutral)), x)
+            _assert_same_pair(call(jnp.full(2, neutral), x), x)
+        for bad in (jnp.nan, -neutral):  # NaN and the non-neutral infinity stay invalid
+            for out in (rule(x, jnp.array([bad, 0.1])), rule(jnp.array([bad, 0.1]), x)):
+                assert not bool(jnp.any(out.valid))
+    bounds = (jnp.full(2, -jnp.inf), jnp.full(2, jnp.inf))
+    clipped = pqif(lambda v: jnp.clip(v, *bounds), operator_strategy="native")(x)
+    _assert_same_pair(clipped, x)
+
+
 def test_sqrt_concave_envelope_and_domain():
     sources = jnp.array([[-1., -1.], [-0.4, 0.6], [0., 0.], [1., 1.]])
     for x in (_pair(shift=1.5),

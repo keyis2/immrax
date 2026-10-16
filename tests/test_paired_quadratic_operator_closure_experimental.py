@@ -46,7 +46,7 @@ def _fibers(value, sources):
 
 def _check(value, exact_lower, exact_upper, sources):
     status = pair_status(value)
-    for key in ("valid", "zero_remainder", "ordered", "finite"):
+    for key in ("valid", "zero_remainder", "finite"):
         assert bool(jnp.all(status[key])), (key, status)
     lower, upper = _fibers(value, sources)
     assert np.min(exact_lower - lower) >= -TOL
@@ -135,7 +135,7 @@ def test_uncertain_boolean_and_discrete_selection_hulls():
     bad_index = _select_n(Interval(jnp.array(0), jnp.array(3)), first, second)
     assert not bool(jnp.all(pair_status(bad_index)["valid"]))
     bad_branch = _select_n(uncertain, first,
-                           PairedQuadratic(second.upper, second.lower))
+                           Interval(jnp.array(0.5), jnp.array(0.25)))
     assert not bool(jnp.all(pair_status(bad_branch)["valid"]))
     compiled = jax.jit(lambda x, y: _select_n(uncertain, x, y))(first, second)
     for a, b in zip(jax.tree.leaves(native), jax.tree.leaves(compiled)):

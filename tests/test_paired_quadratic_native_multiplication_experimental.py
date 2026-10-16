@@ -10,7 +10,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from immrax.inclusion import PairedQuadratic, evaluate_pair, pair_range, pair_status, pqif
+from immrax.inclusion import (
+    PairedQuadratic, evaluate_pair, pair_from_interval, pair_range, pair_status, pqif,
+)
 from immrax.inclusion.interval import Interval
 from immrax.inclusion.paired_quadratic import _mul, _square_pair
 from immrax.inclusion.taylor import TaylorModel
@@ -58,7 +60,7 @@ def _exact_product(x, y, sources):
 
 def _check(result, exact, sources):
     status = pair_status(result)
-    for key in ("valid", "zero_remainder", "ordered", "finite"):
+    for key in ("valid", "zero_remainder", "finite"):
         assert bool(jnp.all(status[key])), (key, status)
     lower, upper = _fibers(result, sources)
     assert np.min(exact[0] - lower) >= -TOL
@@ -191,10 +193,10 @@ def test_eager_jit_vmap_and_fixed_rank_jaxpr_structure():
     print("Source-stable Jaxpr equation counts:", equation_counts)
 
 
-def test_native_invalid_order_and_nonfinite_input_remain_visible():
+def test_native_malformed_ingress_and_nonfinite_input_remain_visible():
     rng = np.random.default_rng(20260930)
     good = _input(2, 0, rng)
-    bad_order = PairedQuadratic(good.upper, good.lower)
+    bad_order = pair_from_interval(Interval(jnp.array(0.5), jnp.array(0.25)), 2)
     bad_finite = PairedQuadratic(
         _model(np.nan, np.zeros(2), np.zeros((2, 2))), good.upper,
     )

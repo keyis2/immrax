@@ -44,9 +44,12 @@ from .taylor import (
 class PairedQuadratic:
     """Two ordered degree-2 endpoint polynomials over shared sources.
 
-    ``valid`` propagates numerical/domain preconditions. Static shape and
-    dtype requirements are checked at construction. Use
-    :func:`pair_status` for the certified ordering and finite predicates.
+    Direct construction is trusted and low level: the caller owns the
+    pointwise order L2(xi) <= U2(xi) on the source box and records any
+    failure to establish it in ``valid``. Ingress conversions such as
+    :func:`pair_from_interval` and :func:`pair_to_taylor` check order; native
+    rules establish it analytically from ordered inputs and do not recheck
+    it. Static shape and dtype requirements are checked at construction.
     """
 
     def __init__(self, lower: TaylorModel, upper: TaylorModel, valid=True):
@@ -125,7 +128,13 @@ class PairedQuadratic:
 
 
 def pair_status(value: PairedQuadratic) -> dict[str, jax.Array]:
-    """Return sound polynomial-order and finite-value checks by component."""
+    """Return diagnostic finite-value and sufficient order checks.
+
+    ``ordered`` is the termwise test range(U2-L2).lower >= 0. It is
+    sufficient, not necessary: e.g. [-w, w] with w=(1+xi)^2 is pointwise
+    ordered while the termwise range of 2w is negative. ``ordered=False`` does
+    not refute the analytic order of an internally constructed pair.
+    """
 
     zero_remainder = (
         (value.lower.remainder.lower == 0)
@@ -157,7 +166,7 @@ _ORDER_ULP_STEPS = 2
 def certify_pair_order(value: PairedQuadratic) -> PairedQuadratic:
     """Raise the upper endpoint enough for termwise ordering certification.
 
-    Call only after an analytic inclusion rule has established that both raw
+    Legacy explicit helper; no default native rule calls it. Call only after an analytic inclusion rule has established that both raw
     endpoints enclose the concrete value. The adjustment uses the sound
     polynomial range of U2-L2, never sampled values. It may widen the pair.
     """
@@ -402,19 +411,20 @@ def _square_polynomial(model: TaylorModel):
 
 
 def _native_input_valid(x: PairedQuadratic, y: PairedQuadratic | None = None):
+    # Order is the input pair's own invariant (see PairedQuadratic); the
+    # termwise pair_status order test is weaker and is not reapplied here.
     status = pair_status(x)
-    valid = x.valid & status["zero_remainder"] & status["ordered"] & status["finite"]
+    valid = x.valid & status["zero_remainder"] & status["finite"]
     if y is not None:
         other = pair_status(y)
-        valid = valid & y.valid & other["zero_remainder"] & other["ordered"] & other["finite"]
+        valid = valid & y.valid & other["zero_remainder"] & other["finite"]
     return valid
 
 
 def _finish_native(lower: TaylorModel, upper: TaylorModel, valid):
-    # The analytic envelope proves pointwise order. The range-based shift
-    # gives the representation its sufficient termwise order certificate.
-    result = certify_pair_order(PairedQuadratic(lower, upper, valid))
-    return _select(valid, result, PairedQuadratic(
+    # The analytic envelope proves pointwise order from ordered inputs; the
+    # endpoints are returned unshifted.
+    return _select(valid, PairedQuadratic(lower, upper, valid), PairedQuadratic(
         _nan_model_like(lower), _nan_model_like(upper), False,
     ))
 
@@ -954,10 +964,7 @@ def _select_n(which, *cases):
         for mask, value in zip(feasible, values):
             reference = _select(mask & ~found, value, reference)
             found = found | mask
-            status = pair_status(value)
-            branch_valid = (value.valid & status["zero_remainder"]
-                            & status["ordered"] & status["finite"])
-            all_valid = all_valid & jnp.where(mask, branch_valid, True)
+            all_valid = all_valid & jnp.where(mask, _native_input_valid(value), True)
         masked_lower = tuple(_where_model(mask, value.lower, reference.lower)
                              for mask, value in zip(feasible, values))
         masked_upper = tuple(_where_model(mask, value.upper, reference.upper)

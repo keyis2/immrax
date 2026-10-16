@@ -10,6 +10,7 @@ from immrax.inclusion import (
     constant_taylor_model,
     evaluate_pair,
     normalized_pair_seed,
+    pair_from_interval,
     pair_from_taylor,
     pair_range,
     pair_status,
@@ -102,6 +103,29 @@ def test_invalid_order_is_visible_to_conversion():
     bad = PairedQuadratic(good, good - 0.25)
     assert not bool(jnp.all(pair_status(bad)["ordered"]))
     assert bool(jnp.isnan(pair_to_taylor(bad).constant))
+    reversed_interval = Interval(jnp.array(1.0), jnp.array(0.75))
+    assert not bool(pair_from_interval(reversed_interval, 2).valid)
+
+
+def test_analytic_order_is_not_rechecked_or_widened_by_native_rules():
+    # w=(1+xi)^2 >= 0, but the termwise range of U-L=2w is [-2, 8].
+    zero = Interval(jnp.array(0.0), jnp.array(0.0))
+    w = TaylorModel(jnp.array(1.0), jnp.array([2.0]), jnp.array([[2.0]]), zero)
+    pair = PairedQuadratic(-w, w)
+    grid = jnp.linspace(-1.0, 1.0, 2001)[:, None]
+    lower, upper = jax.vmap(lambda z: evaluate_pair(pair, z))(grid)
+    assert bool(jnp.all(upper - lower >= 0))
+    assert not bool(pair_status(pair)["ordered"])
+
+    result = pqif(jnp.abs, operator_strategy="native")(pair)
+    status = pair_status(result)
+    assert all(bool(status[k]) for k in ("valid", "finite", "zero_remainder"))
+    # The removed certify_pair_order shift would have raised U by 2.
+    _assert_pair_close(result, pair)
+    low, high = jax.vmap(lambda z: evaluate_pair(result, z))(grid)
+    for t in (-1.0, -0.4, 0.0, 0.7, 1.0):
+        exact = jnp.abs(t * upper)
+        assert bool(jnp.all((low <= exact) & (exact <= high)))
 
 
 def test_order_certificate_survives_shift_absorbed_by_rounding():
@@ -119,11 +143,12 @@ def test_order_certificate_survives_shift_absorbed_by_rounding():
     assert 0 < float(certified.upper.constant - upper.constant) <= 2 * np.spacing(1.0)
     np.testing.assert_array_equal(certified.lower.constant, lower.constant)
 
-    # The native sqrt of a degenerate pair yields such a sliver through its own order certificate.
+    # The native sqrt of a degenerate pair is an analytic sliver; it is
+    # accepted without the termwise order certificate.
     x = model(4.01e-4, [0.0, 4e-15], 1e-26)
     root = pqif(jnp.sqrt, operator_strategy="native")(PairedQuadratic(x, x))
     status = pair_status(root)
-    assert all(bool(status[k]) for k in ("valid", "finite", "zero_remainder", "ordered"))
+    assert all(bool(status[k]) for k in ("valid", "finite", "zero_remainder"))
     sources = jnp.array([[-1.0, -1.0], [-1.0, 1.0], [0.3, -0.7], [1.0, 1.0], [0.0, 0.0]])
     for source in sources:
         value = jnp.sqrt(evaluate_pair(PairedQuadratic(x, x), source)[0])

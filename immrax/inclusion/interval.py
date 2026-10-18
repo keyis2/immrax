@@ -7,6 +7,16 @@ from jaxtyping import ArrayLike
 import numpy as onp
 
 
+def _down(value: jax.Array) -> jax.Array:
+    value = jnp.asarray(value)
+    return jnp.nextafter(value, jnp.full_like(value, -jnp.inf))
+
+
+def _up(value: jax.Array) -> jax.Array:
+    value = jnp.asarray(value)
+    return jnp.nextafter(value, jnp.full_like(value, jnp.inf))
+
+
 @register_pytree_node_class
 class Interval:
     """Interval: A class to represent an interval in :math:`\\mathbb{R}^n`.
@@ -32,6 +42,17 @@ class Interval:
     def tree_unflatten(cls, _, children):
         return cls(*children)
 
+    @classmethod
+    def point(cls, value: ArrayLike) -> "Interval":
+        value = jnp.asarray(value)
+        return cls(value, value)
+
+    @classmethod
+    def from_mid_radius(cls, midpoint: ArrayLike, radius: ArrayLike) -> "Interval":
+        midpoint = jnp.asarray(midpoint)
+        radius = jnp.asarray(radius)
+        return cls(_down(midpoint - radius), _up(midpoint + radius))
+
     @property
     def dtype(self) -> jnp.dtype:
         return self.lower.dtype
@@ -55,6 +76,18 @@ class Interval:
     @property
     def pert(self) -> jax.Array:
         return (self.upper - self.lower) / 2
+
+    @property
+    def midpoint(self) -> jax.Array:
+        return self.center
+
+    @property
+    def radius(self) -> jax.Array:
+        return self.pert
+
+    @property
+    def magnitude(self) -> jax.Array:
+        return jnp.maximum(jnp.abs(self.lower), jnp.abs(self.upper))
 
     def __matmul__(self, _: "Interval") -> "Interval": ...
     def __truediv__(self, _: "Interval") -> "Interval": ...
@@ -99,6 +132,29 @@ class Interval:
     def __or__(self, other: "Interval") -> "Interval":
         return interval(
             jnp.minimum(self.lower, other.lower), jnp.maximum(self.upper, other.upper)
+        )
+
+    def hull(self, other: "Interval") -> "Interval":
+        return self | other
+
+    def inflate(self, relative: float = 0.05, absolute: float = 1e-14) -> "Interval":
+        radius = (1.0 + relative) * self.radius + absolute
+        return Interval.from_mid_radius(self.midpoint, radius)
+
+    def contains(self, value: ArrayLike) -> jax.Array:
+        value = jnp.asarray(value)
+        return jnp.all((value >= self.lower) & (value <= self.upper))
+
+    def strictly_contains(self, other: "Interval", margin: float = 0.0) -> jax.Array:
+        return jnp.all(
+            (other.lower > self.lower + margin)
+            & (other.upper < self.upper - margin)
+        )
+
+    def take(self, indices: ArrayLike, axis: int = 0) -> "Interval":
+        return Interval(
+            jnp.take(self.lower, indices, axis=axis),
+            jnp.take(self.upper, indices, axis=axis),
         )
 
     def __str__(self) -> str:

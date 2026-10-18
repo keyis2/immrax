@@ -1,11 +1,10 @@
-"""Experimental native degree-2 polynomial over the normalized source box.
+"""Degree-2 polynomials over the normalized source box.
 
 A QuadraticPolynomial represents p(xi) = c + l^T xi + xi^T Q xi / 2 for
 xi in [-1, 1]^m. It carries no interval remainder. Operator arithmetic is
 exact; ``quadratic_product`` and ``quadratic_square`` return lower/upper
 degree-2 polynomials whose constants absorb the omitted degree-3/4 range.
 Source identity is not tracked; operands must share one normalized seed.
-This module is opt-in by its full path and is not exported.
 """
 
 from __future__ import annotations

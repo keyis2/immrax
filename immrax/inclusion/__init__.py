@@ -45,19 +45,12 @@ from .nif import natif
 from .selection import argmin_select
 from .paired_quadratic import (
     PairedQuadratic,
-    PairAudit,
-    certify_pair_order,
     constant_pair,
     evaluate_pair,
     normalized_pair_seed,
     pair_from_interval,
-    pair_from_taylor,
     pair_range,
     pair_status,
-    pair_to_taylor,
-    pqif,
-    register_pair_rule,
-    register_pair_taylor_fallback,
 )
 from .paired_quadratic_selfmap import (
     append_pair_sources,
@@ -68,6 +61,12 @@ from .paired_quadratic_selfmap import (
     shared_correction_lift,
     singleton_pair,
 )
+from .paired_quadratic_transform import (
+    UnsupportedPairPrimitive,
+    pair_primitive_rules,
+    pqif,
+)
+from .quadratic_polynomial import QuadraticPolynomial, quadratic_range
 from .taylor import (
     QuadraticEndpointPair,
     TaylorModel,
@@ -101,10 +100,10 @@ __all__ = [
     "Interval",
     "Permutation",
     "PairedQuadratic",
-    "PairAudit",
-    "certify_pair_order",
+    "QuadraticPolynomial",
     "QuadraticEndpointPair",
     "TaylorModel",
+    "UnsupportedPairPrimitive",
     "affif",
     "affine_bound",
     "affine_bound_to_interval",
@@ -151,17 +150,15 @@ __all__ = [
     "normalized_taylor_seed",
     "normalized_pair_seed",
     "pair_from_interval",
-    "pair_from_taylor",
     "pair_hull",
     "pair_inclusion_margins",
+    "pair_primitive_rules",
     "pair_range",
     "pair_status",
-    "pair_to_taylor",
     "polynomial_range",
     "project_pair_sources",
+    "quadratic_range",
     "pqif",
-    "register_pair_rule",
-    "register_pair_taylor_fallback",
     "register_taylor_rule",
     "relu_endpoint_pair",
     "select_taylor_model",

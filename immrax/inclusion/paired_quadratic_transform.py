@@ -1,18 +1,17 @@
-"""Experimental Taylor-free paired-quadratic JAX transform.
+"""Paired-quadratic JAX transform ``pqif``.
 
-``native_pqif(f)`` traces ``f`` once at point shapes and interprets its Jaxpr
-with native ``PairedQuadratic`` leaves through an explicit primitive
-registry. A primitive without a native rule raises
-``UnsupportedNativePairPrimitive``; there is no Taylor fallback.
+``pqif(f)`` traces ``f`` once at point shapes and interprets its Jaxpr
+with ``PairedQuadratic`` leaves through an explicit primitive
+registry. A primitive without a rule raises
+``UnsupportedPairPrimitive``; there is no Taylor fallback.
 
 Validity is per output element: elementwise rules propagate it elementwise
 and mixing rules (``reduce_sum``, ``dot_general``, ``scatter-add``) reduce it
 over exactly the contributing input axes. Comparisons with a pair operand
 return a Boolean ``Interval`` [definitely, possibly]; ``select_n`` selects
-exactly where it is decided and uses the legacy constant-shift branch hull
+exactly where it is decided and uses a constant-shift branch hull
 where it is not. Callers extend the registry for one transform through
-``native_pqif(f, primitive_rules=...)``; nested Jaxprs see the same rules.
-This module is opt-in by its full path and is not exported.
+``pqif(f, primitive_rules=...)``; nested Jaxprs see the same rules.
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ from jax import lax
 from jax.extend.core import Literal, primitives
 
 from .interval import Interval
-from .paired_quadratic_native_experimental import (
+from .paired_quadratic import (
     PairedQuadratic,
     constant_pair,
     pair_abs,
@@ -41,15 +40,15 @@ from .paired_quadratic_native_experimental import (
     pair_sqrt,
     pair_trig,
 )
-from .quadratic_polynomial_experimental import QuadraticPolynomial, quadratic_range
+from .quadratic_polynomial import QuadraticPolynomial, quadratic_range
 
 
-class UnsupportedNativePairPrimitive(NotImplementedError):
-    """A traced primitive reached a native pair value without a native rule."""
+class UnsupportedPairPrimitive(NotImplementedError):
+    """A traced primitive reached a paired value without a paired rule."""
 
     def __init__(self, primitive):
         self.primitive = primitive.name
-        super().__init__(f"native paired-quadratic primitive unsupported (no fallback): {primitive.name}")
+        super().__init__(f"paired-quadratic primitive unsupported (no fallback): {primitive.name}")
 
 
 def _is_abstract(value):
@@ -92,7 +91,7 @@ def _structural(primitive, valid_rule=None):
 
     def rule(x, *points, **params):
         if any(_is_abstract(point) for point in points):
-            raise TypeError(f"native {primitive.name} requires point-valued indices")
+            raise TypeError(f"paired {primitive.name} requires point-valued indices")
         apply = lambda value: primitive.bind(value, *points, **params)
         if isinstance(x, Interval):  # Boolean control masks are reshaped/indexed too.
             return Interval(apply(x.lower), apply(x.upper))
@@ -107,7 +106,7 @@ def _reduce_sum_valid(valid, *, axes, **_):
 
 
 def _convert(x, **params):
-    """Legacy conversion: control Intervals map endpointwise; bool gives [definitely, possibly] nonzero."""
+    """Conversion: control Intervals map endpointwise; bool gives [definitely, possibly] nonzero."""
     apply = lambda value: lax.convert_element_type_p.bind(value, **params)
     if params["new_dtype"] == jnp.bool_:
         if isinstance(x, Interval):
@@ -121,7 +120,7 @@ def _convert(x, **params):
     if isinstance(x, Interval):
         return Interval(apply(x.lower), apply(x.upper))
     if not jnp.issubdtype(params["new_dtype"], jnp.floating):
-        raise TypeError("native pair conversion to a non-floating, non-Boolean dtype is unsupported")
+        raise TypeError("paired conversion to a non-floating, non-Boolean dtype is unsupported")
     return _map_pair(apply, x, x.valid)
 
 
@@ -182,7 +181,7 @@ def _binary_mask_pair(mask: Interval, like: PairedQuadratic) -> PairedQuadratic:
 
     For the bilinear summand x_i * m_i the extrema over {0, 1} and [0, 1]
     coincide, so [lower, upper] is a sound local operand where it lies in
-    [0, 1]; elsewhere the relaxed element is invalid (legacy rule).
+    [0, 1]; elsewhere the relaxed element is invalid.
     """
     inside = (mask.lower >= 0) & (mask.upper <= 1) & (mask.lower <= mask.upper)
     numeric = Interval(mask.lower.astype(like.dtype), mask.upper.astype(like.dtype))
@@ -260,7 +259,7 @@ def _select_n(which, *cases):
 
 
 def _select_control(which, cases):
-    """Legacy Interval selection among point/control cases: exact if fixed, else the case hull."""
+    """Interval selection among point/control cases: exact if fixed, else the case hull."""
     intervals = [_control(case) for case in cases]
     which = _control(which)
     shape = jnp.broadcast_shapes(jnp.shape(which.lower), *(jnp.shape(c.lower) for c in intervals))
@@ -298,7 +297,7 @@ def _scatter(primitive):
 
     def rule(operand, indices, updates, **params):
         if _is_abstract(indices):
-            raise TypeError(f"native {primitive.name} requires point-valued indices")
+            raise TypeError(f"paired {primitive.name} requires point-valued indices")
         like = _template((operand, updates))
         operand, updates = _promote(operand, like), _promote(updates, like)
         apply = lambda left, right: primitive.bind(left, indices, right, **params)
@@ -321,7 +320,7 @@ def _scatter(primitive):
     return rule
 
 
-native_pair_registry: dict[Any, Callable[..., Any]] = {
+pair_primitive_rules: dict[Any, Callable[..., Any]] = {
     lax.add_p: _add,
     primitives.add_jaxvals_p: _add,  # JVP tangent accumulation
     lax.sub_p: _sub,
@@ -365,7 +364,7 @@ native_pair_registry: dict[Any, Callable[..., Any]] = {
 }
 
 
-def interpret_native_pair_jaxpr(jaxpr, consts, *args, registry=None, source_size=None) -> list[Any]:
+def pair_jaxpr(jaxpr, consts, *args, registry=None, source_size=None) -> list[Any]:
     """Evaluate the live output slice; abstract equations use ``registry``.
 
     Nested ``jit`` calls are interpreted recursively with the same registry.
@@ -373,7 +372,7 @@ def interpret_native_pair_jaxpr(jaxpr, consts, *args, registry=None, source_size
     (e.g. a converted Boolean mask) enters as a constant endpoint pair, the
     same ingress rule as for transform arguments.
     """
-    registry = native_pair_registry if registry is None else registry
+    registry = pair_primitive_rules if registry is None else registry
 
     def embed(value):
         if (source_size is not None and isinstance(value, Interval)
@@ -399,10 +398,10 @@ def interpret_native_pair_jaxpr(jaxpr, consts, *args, registry=None, source_size
         if any(_is_abstract(value) for value in inputs):
             if equation.primitive is primitives.jit_p:
                 closed = equation.params["jaxpr"]
-                answer = interpret_native_pair_jaxpr(closed.jaxpr, closed.consts, *inputs,
+                answer = pair_jaxpr(closed.jaxpr, closed.consts, *inputs,
                                                      registry=registry, source_size=source_size)
             elif (rule := registry.get(equation.primitive)) is None:
-                raise UnsupportedNativePairPrimitive(equation.primitive)
+                raise UnsupportedPairPrimitive(equation.primitive)
             else:
                 answer = rule(*inputs, **equation.params)
         else:
@@ -413,16 +412,16 @@ def interpret_native_pair_jaxpr(jaxpr, consts, *args, registry=None, source_size
     return [read(v) for v in jaxpr.outvars]
 
 
-def native_pqif(function: Callable[..., Any], *, primitive_rules=None) -> Callable[..., Any]:
-    """Transform a point function through native ordered quadratic pairs.
+def pqif(function: Callable[..., Any], *, primitive_rules=None) -> Callable[..., Any]:
+    """Transform a point function through ordered quadratic endpoint pairs.
 
     Positional and keyword ``PairedQuadratic`` leaves must share one source
     dimension. Floating ``Interval`` leaves enter as constant endpoint pairs.
     ``primitive_rules`` maps extra primitives (e.g. caller-owned custom atoms)
-    to native rules for this transform only; it extends a copy of the core
+    to rules for this transform only; it extends a copy of the core
     registry. Returns one output, or a tuple for several outputs.
     """
-    registry = dict(native_pair_registry)
+    registry = dict(pair_primitive_rules)
     registry.update(primitive_rules or {})
 
     @wraps(function)
@@ -444,7 +443,7 @@ def native_pqif(function: Callable[..., Any], *, primitive_rules=None) -> Callab
         closed = eqx.filter_make_jaxpr(lambda a, k: function(*a, **k))(*trace)[0]
         flat = [leaf for leaf in jax.tree_util.tree_leaves(tree, is_leaf=_is_abstract)
                 if isinstance(leaf, PairedQuadratic) or eqx.is_array(leaf)]
-        outputs = interpret_native_pair_jaxpr(closed.jaxpr, closed.consts, *flat, registry=registry,
+        outputs = pair_jaxpr(closed.jaxpr, closed.consts, *flat, registry=registry,
                                               source_size=source_size)
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
 

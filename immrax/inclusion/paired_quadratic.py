@@ -625,10 +625,27 @@ def _div_native(x, y, *, multiplication_strategy="midpoint"):
         if isinstance(x, Interval) or isinstance(y, Interval):
             return taylor_inclusion_registry[lax.div_p](x, y)
         return lax.div_p.bind(x, y)
+    if isinstance(x, PairedQuadratic) and not isinstance(y, (PairedQuadratic, Interval)):
+        # A point denominator has one reciprocal. Scaling both endpoints by it,
+        # as ``_mul`` does for point factors, keeps a singleton numerator a
+        # singleton; the reciprocal-pair route evaluates 1/y by two formulas
+        # whose rounding can reverse the endpoints.
+        return _scale(x, jnp.reciprocal(jnp.asarray(y)))
     like = _template(x, y)
     x, y = _promote(x, like), _promote(y, like)
-    return _mul(x, _reciprocal_pair(y),
-                multiplication_strategy=multiplication_strategy)
+    general = _mul(x, _reciprocal_pair(y),
+                   multiplication_strategy=multiplication_strategy)
+    # An exactly constant pair denominator is a point carried as a pair; it
+    # takes the same one-reciprocal scaling. Zero, nonfinite, invalid and
+    # source-dependent denominators keep the reciprocal-pair enclosure.
+    c = y.lower.constant
+    point = (_exact_singleton(y) & y.valid
+             & jnp.all(y.lower.linear == 0, axis=-1)
+             & jnp.all(y.lower.quadratic == 0, axis=(-2, -1))
+             & (y.lower.remainder.lower == 0) & (y.lower.remainder.upper == 0)
+             & jnp.isfinite(c) & (c != 0))
+    scaled = _scale(x, jnp.reciprocal(jnp.where(point, c, 1.0)))
+    return _select(jnp.broadcast_to(point, general.shape), scaled, general)
 
 
 def _relu_polynomial(model: TaylorModel) -> tuple[TaylorModel, TaylorModel]:
@@ -739,6 +756,18 @@ def _curvature_unary_polynomial(model: TaylorModel, kind: str,
             core + 0.5 * curvature_bound * square_upper)
 
 
+def _exact_singleton(value: PairedQuadratic):
+    """Whether both endpoint containers are exactly the same polynomial."""
+    lower, upper = value.lower, value.upper
+    return (
+        (lower.constant == upper.constant)
+        & jnp.all(lower.linear == upper.linear, axis=-1)
+        & jnp.all(lower.quadratic == upper.quadratic, axis=(-2, -1))
+        & (lower.remainder.lower == upper.remainder.lower)
+        & (lower.remainder.upper == upper.remainder.upper)
+    )
+
+
 def _trig_native(kind: str, x, *, curvature="global"):
     primitive = lax.sin_p if kind == "sin" else lax.cos_p
     if not isinstance(x, PairedQuadratic):
@@ -774,12 +803,23 @@ def _trig_native(kind: str, x, *, curvature="global"):
         source_lower, kind, curvature_bound)
     _, upper = _curvature_unary_polynomial(
         source_upper, kind, curvature_bound)
+    # A singleton has one shared source polynomial, so the global
+    # |f''| <= 1 Taylor envelope remains sound even when its scalar range
+    # crosses a critical point.  The local endpoint-only curvature bound is
+    # only valid on the monotone branch and is deliberately not reused here.
+    singleton = _exact_singleton(x)
+    singleton_lower, singleton_upper = _curvature_unary_polynomial(
+        x.lower, kind, 1.0)
+    critical_singleton = ~monotone & singleton
     constant_lower = constant_taylor_model(-jnp.ones_like(x.lower.constant), x.source_size)
     constant_upper = constant_taylor_model(jnp.ones_like(x.upper.constant), x.source_size)
-    lower = _where_model(monotone, lower, constant_lower)
-    upper = _where_model(monotone, upper, constant_upper)
+    lower = _where_model(
+        monotone, lower, _where_model(singleton, singleton_lower, constant_lower))
+    upper = _where_model(
+        monotone, upper, _where_model(singleton, singleton_upper, constant_upper))
     _record(f"{kind}.monotone", "branch", monotone)
-    _record(f"{kind}.critical_constant_hull", "branch", ~monotone)
+    _record(f"{kind}.critical_singleton_curvature", "branch", critical_singleton)
+    _record(f"{kind}.critical_constant_hull", "branch", ~monotone & ~singleton)
     return _finish_native(lower, upper, _native_input_valid(x))
 
 
@@ -1091,10 +1131,19 @@ def _pair_jit_rule(*args, multiplication_strategy="midpoint",
                       trig_curvature=trig_curvature)
 
 
-def _integer_square(x, *, y, multiplication_strategy):
-    if y != 2:
-        raise NotImplementedError("paired integer_pow only supports square (y=2)")
-    if multiplication_strategy == "taylor" or not isinstance(x, PairedQuadratic):
+def _integer_pow(x, *, y, multiplication_strategy):
+    if y not in (0, 1, 2):
+        raise NotImplementedError(
+            "paired integer_pow only supports exponents 0, 1, and 2"
+        )
+    if not isinstance(x, PairedQuadratic):
+        return _fallback(lax.integer_pow_p, x, y=y)
+    if y == 0:
+        one = constant_taylor_model(jnp.ones_like(x.lower.constant), x.source_size)
+        return PairedQuadratic(one, one, x.valid)
+    if y == 1:
+        return x
+    if multiplication_strategy == "taylor":
         return _fallback(lax.integer_pow_p, x, y=y)
     return _square_pair(x)
 
@@ -1171,7 +1220,7 @@ def pair_jaxpr(jaxpr, consts, *args, multiplication_strategy="midpoint",
         (isinstance(x, PairedQuadratic) or isinstance(y, PairedQuadratic))
         and (isinstance(x, Interval) or isinstance(y, Interval))
     ) else _fallback(lax.dot_general_p, x, y, **p)
-    registry[lax.integer_pow_p] = lambda x, *, y: _integer_square(
+    registry[lax.integer_pow_p] = lambda x, *, y: _integer_pow(
         x, y=y, multiplication_strategy=multiplication_strategy,
     )
     try:

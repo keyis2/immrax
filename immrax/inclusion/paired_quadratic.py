@@ -466,25 +466,52 @@ def pair_sqrt(x: PairedQuadratic) -> PairedQuadratic:
     return _finish(lower, upper, _input_valid(x) & domain)
 
 
-def _curvature_unary(p: QuadraticPolynomial, kind: str, curvature_bound=1.0):
-    """Degree-2 envelopes of sin/cos(p) from |f''| <= curvature_bound."""
+def _trig_range(kind, lower, upper):
+    """Range from interval endpoints and every possible interior extremum."""
+    function = jnp.sin if kind == "sin" else jnp.cos
+    lo = jnp.minimum(function(lower), function(upper))
+    hi = jnp.maximum(function(lower), function(upper))
+    max_offset = jnp.pi / 2 if kind == "sin" else 0.0
+    min_offset = -jnp.pi / 2 if kind == "sin" else jnp.pi
+    period = 2 * jnp.pi
+
+    def contains(offset):
+        return jnp.ceil((lower-offset)/period) <= jnp.floor((upper-offset)/period)
+
+    broad = upper-lower >= period
+    return (jnp.where(broad | contains(min_offset), -1.0, lo),
+            jnp.where(broad | contains(max_offset), 1.0, hi))
+
+
+def _curvature_unary(p: QuadraticPolynomial, kind: str):
+    """Signed local-curvature Taylor envelopes of sin/cos(p).
+
+    The range of p contains the segment from its range midpoint to p(xi).
+    On that interval f''=-f, so Taylor's integral remainder lies between
+    k_lower*delta**2/2 and k_upper*delta**2/2. Degree reduction of delta**2
+    selects the opposite square endpoint when its curvature is negative.
+    """
     bounds = quadratic_range(p)
     center = 0.5 * bounds.lower + 0.5 * bounds.upper
     delta = p - center
-    _, square_upper = quadratic_square(delta)
+    square_lower, square_upper = quadratic_square(delta)
+    f_lower, f_upper = _trig_range(kind, bounds.lower, bounds.upper)
+    curvature_lower, curvature_upper = -f_upper, -f_lower
     if kind == "sin":
         core = jnp.sin(center) + delta * jnp.cos(center)
     else:
         core = jnp.cos(center) - delta * jnp.sin(center)
-    return (core - 0.5 * curvature_bound * square_upper,
-            core + 0.5 * curvature_bound * square_upper)
+    lower_square = _where(curvature_lower >= 0, square_lower, square_upper)
+    upper_square = _where(curvature_upper >= 0, square_upper, square_lower)
+    return (core + lower_square * (0.5 * curvature_lower),
+            core + upper_square * (0.5 * curvature_upper))
 
 
 def pair_trig(kind: str, x: PairedQuadratic) -> PairedQuadratic:
-    """Global-curvature sin/cos rule with the singleton critical branch.
+    """Signed local-curvature sin/cos rule with the singleton critical branch.
 
     On a monotone sector the increasing (decreasing) endpoint feeds each side.
-    A range touching a critical point uses the global |f''| <= 1 envelope of
+    A range touching a critical point uses the signed-curvature envelope of
     an exact singleton's one polynomial, and otherwise the constant [-1, 1].
     """
     global_range = pair_range(x)

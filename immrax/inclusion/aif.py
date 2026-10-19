@@ -1478,15 +1478,15 @@ def _unary_linear_primitive(primitive, x, **kwargs):
 def _copy(x):
     if isinstance(x, AffineBound):
         return _new(
-            lax.copy(x.lower_coeff),
-            lax.copy(x.lower_bias),
-            lax.copy(x.upper_coeff),
-            lax.copy(x.upper_bias),
+            lax.copy_p.bind(x.lower_coeff),
+            lax.copy_p.bind(x.lower_bias),
+            lax.copy_p.bind(x.upper_coeff),
+            lax.copy_p.bind(x.upper_bias),
             x,
         )
     if isinstance(x, Interval):
-        return Interval(lax.copy(x.lower), lax.copy(x.upper))
-    return lax.copy(x)
+        return Interval(lax.copy_p.bind(x.lower), lax.copy_p.bind(x.upper))
+    return lax.copy_p.bind(x)
 
 
 def _stop_gradient(x):

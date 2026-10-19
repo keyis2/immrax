@@ -282,8 +282,8 @@ def _signed_pair(sign, shape=(2, 3), seed=20):
 
 
 def _margin(result, function, *pairs, points=7):
-    """Least sampled containment margin of concrete values over [-1, 1]^3."""
-    grid = jnp.asarray(_grid(3, points))
+    """Least sampled containment margin over the result's source box."""
+    grid = jnp.asarray(_grid(result.source_size, points))
     lower, upper = jax.vmap(lambda xi: evaluate_pair(result, xi))(grid)
     ends = [jax.vmap(lambda xi, p=p: evaluate_pair(p, xi))(grid) for p in pairs]
     margin = np.inf
@@ -626,6 +626,63 @@ def test_sqrt_rejects_negative_domain_per_element():
     result = pair_sqrt(denominator)
     np.testing.assert_array_equal(result.valid, ~crossing)
     assert bool(jnp.all(jnp.isnan(result.upper.constant[crossing])))
+
+
+def test_trig_signed_curvature_retains_one_sided_small_angle_quadratics():
+    radius = 1e-3
+    x = normalized_pair_seed(jnp.array([-radius]), jnp.array([radius]))[0]
+    cosine, sine = pair_trig("cos", x), pair_trig("sin", x)
+    # Cosine is concave on this whole interval. Its lower quadratic retains
+    # -delta**2/2 rather than adding a symmetric curvature remainder.
+    np.testing.assert_allclose(cosine.lower.quadratic, [[-radius**2]], rtol=1e-14)
+    np.testing.assert_allclose(cosine.upper.quadratic, [[-np.cos(radius)*radius**2]], rtol=1e-14)
+    assert float(quadratic_range(.5*(cosine.upper-cosine.lower)).upper) < 3e-13
+    assert float(quadratic_range(.5*(sine.upper-sine.lower)).upper) < 6e-10
+    for kind, function, result in (("cos", jnp.cos, cosine), ("sin", jnp.sin, sine)):
+        assert _margin(result, function, x) >= -1e-14, kind
+
+
+def test_trig_quadratic_input_signed_remainder_and_nonsingleton_domains():
+    # Both negative-curvature cases have a genuinely quadratic delta, whose
+    # square has distinct degree-reduced endpoints. Using square_upper for
+    # the negative upper remainder would fail containment near xi=0.
+    p = QuadraticPolynomial(jnp.array(.7), jnp.array([.2]), jnp.array([[.3]]))
+    exact = PairedQuadratic(p, p)
+    for kind, function in (("sin", jnp.sin), ("cos", jnp.cos)):
+        for value in (exact, PairedQuadratic(p-.01, p+.01), -exact):
+            result = pair_trig(kind, value)
+            assert bool(result.valid)
+            assert _margin(result, function, value) >= -1e-14
+    # Cross an interior maximum/minimum, and cover more than a full period.
+    for center, radius in ((np.pi/2, .3), (0., .2), (2., 4.)):
+        value = normalized_pair_seed(jnp.array([center-radius]), jnp.array([center+radius]))[0]
+        for kind, function in (("sin", jnp.sin), ("cos", jnp.cos)):
+            assert _margin(pair_trig(kind, value), function, value) >= -1e-14
+    crossing = PairedQuadratic(p-.8, p+.8)
+    hull = pair_trig("cos", crossing)
+    np.testing.assert_array_equal(hull.lower.constant, -1.)
+    np.testing.assert_array_equal(hull.upper.constant, 1.)
+    np.testing.assert_array_equal(hull.lower.linear, 0.)
+    np.testing.assert_array_equal(hull.upper.quadratic, 0.)
+
+
+def test_trig_constant_invalid_and_jit_vmap_contract():
+    for kind, function in (("sin", jnp.sin), ("cos", jnp.cos)):
+        constant = pair_trig(kind, constant_pair(jnp.array([0., np.pi/2]), 1))
+        np.testing.assert_array_equal(constant.lower.constant, function(jnp.array([0., np.pi/2])))
+        _assert_same(constant.lower, constant.upper)
+        p = QuadraticPolynomial(jnp.array([.2, .7, jnp.inf]),
+                                jnp.ones((3, 1))*.1, jnp.ones((3, 1, 1))*.02)
+        result = pair_trig(kind, PairedQuadratic(p, p, jnp.array([True, False, True])))
+        np.testing.assert_array_equal(result.valid, [True, False, False])
+        assert bool(jnp.all(jnp.isnan(result.upper.constant[1:])))
+        inputs = normalized_pair_seed(jnp.array([-.2, .5]), jnp.array([.2, .9]))
+        rule = lambda value: pair_trig(kind, value)
+        eager = rule(inputs)
+        for actual in (jax.jit(rule)(inputs), jax.jit(jax.vmap(rule))(inputs)):
+            for a, b in zip(jax.tree.leaves(actual)[:-1], jax.tree.leaves(eager)[:-1]):
+                np.testing.assert_allclose(a, b, rtol=1e-13, atol=1e-15)
+            np.testing.assert_array_equal(actual.valid, eager.valid)
 
 
 def test_pqif_nonsmooth_logic_scatter_and_branch_hull_contain_samples():

@@ -43,10 +43,10 @@ def singleton_pair(polynomial: QuadraticPolynomial) -> PairedQuadratic:
     return PairedQuadratic(polynomial, polynomial)
 
 
-def _outward_ulps(value, count: int):
+def _radius_ulp_guard(value, count: int):
     count = operator.index(count)
     if count < 0:
-        raise ValueError("outward_ulp_steps must be nonnegative")
+        raise ValueError("radius_ulp_steps must be nonnegative")
     result = jnp.asarray(value)
     infinity = jnp.asarray(jnp.inf, dtype=result.dtype)
     for _ in range(count):
@@ -54,7 +54,7 @@ def _outward_ulps(value, count: int):
     return result
 
 
-def shared_correction_lift(value: PairedQuadratic, retained_source_count: int, *, outward_ulp_steps: int = 2):
+def shared_correction_lift(value: PairedQuadratic, retained_source_count: int, *, radius_ulp_steps: int = 2):
     """Lift a vector tube into one shared correction source per output.
 
     For the floating-point midpoint ``m = (L + U) / 2`` the singleton
@@ -62,8 +62,11 @@ def shared_correction_lift(value: PairedQuadratic, retained_source_count: int, *
 
     ``rho_i >= max(sup(m_i - L_i), sup(U_i - m_i))``
 
-    (then a fixed outward-ULP step), so projecting ``eta`` contains the
+    (then a local ULP guard), so projecting ``eta`` contains the
     original pair including the rounding of ``m``. Returns the lift and rho.
+
+    Without the guard, projection of the seed-3 curved regression gives an
+    upper inclusion margin of -2.22e-16. Two ULPs repair this local invariant.
     """
 
     retained_source_count = operator.index(retained_source_count)
@@ -75,7 +78,7 @@ def shared_correction_lift(value: PairedQuadratic, retained_source_count: int, *
     midpoint = 0.5 * (value.lower + value.upper)
     radius = jnp.maximum(quadratic_range(midpoint - value.lower).upper,
                          quadratic_range(value.upper - midpoint).upper)
-    radius = _outward_ulps(radius, outward_ulp_steps)
+    radius = _radius_ulp_guard(radius, radius_ulp_steps)
     output_size = value.shape[0]
     lifted = _append_sources(midpoint, output_size)
     rows = jnp.arange(output_size)

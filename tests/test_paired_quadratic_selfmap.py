@@ -71,11 +71,11 @@ def test_append_singleton_hull_inflate_and_margins(name):
 
 def test_shared_correction_lift_radius_contract_and_containment():
     value = _pair((3,), 2, seed=3)
-    lift, radius = shared_correction_lift(value, 2, outward_ulp_steps=0)
+    lift, radius = shared_correction_lift(value, 2, radius_ulp_steps=0)
     midpoint = 0.5 * (value.lower + value.upper)
     expected = jnp.maximum(quadratic_range(midpoint - value.lower).upper, quadratic_range(value.upper - midpoint).upper)
     np.testing.assert_array_equal(radius, expected)
-    # The supported lift adds two outward ULPs; projection rounding needs them.
+    # The local two-ULP guard repairs the seed-3 projection's -2.22e-16 margin.
     lift, stepped = shared_correction_lift(value, 2)
     np.testing.assert_array_equal(stepped, jnp.nextafter(jnp.nextafter(radius, jnp.inf), jnp.inf))
     assert lift.source_size == 5 and bool(jnp.all(lift.valid)) and lift.lower is lift.upper
@@ -95,7 +95,7 @@ def test_lift_radius_covers_midpoint_rounding_where_half_width_fails():
     lower = QuadraticPolynomial(constant, base.linear, base.quadratic)
     upper = QuadraticPolynomial(jnp.nextafter(constant, jnp.inf), base.linear, base.quadratic)
     value = PairedQuadratic(lower, upper)
-    lift, radius = shared_correction_lift(value, 2, outward_ulp_steps=0)
+    lift, radius = shared_correction_lift(value, 2, radius_ulp_steps=0)
     projected, _, _ = project_pair_sources(lift, 2)
     assert all(bool(jnp.all(margin >= 0)) for margin in pair_inclusion_margins(projected, value))
     old_radius = quadratic_range(0.5 * (value.upper - value.lower)).upper

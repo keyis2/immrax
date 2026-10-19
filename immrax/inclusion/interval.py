@@ -7,16 +7,6 @@ from jaxtyping import ArrayLike
 import numpy as onp
 
 
-def _down(value: jax.Array) -> jax.Array:
-    value = jnp.asarray(value)
-    return jnp.nextafter(value, jnp.full_like(value, -jnp.inf))
-
-
-def _up(value: jax.Array) -> jax.Array:
-    value = jnp.asarray(value)
-    return jnp.nextafter(value, jnp.full_like(value, jnp.inf))
-
-
 @register_pytree_node_class
 class Interval:
     """Interval: A class to represent an interval in :math:`\\mathbb{R}^n`.
@@ -51,7 +41,7 @@ class Interval:
     def from_mid_radius(cls, midpoint: ArrayLike, radius: ArrayLike) -> "Interval":
         midpoint = jnp.asarray(midpoint)
         radius = jnp.asarray(radius)
-        return cls(_down(midpoint - radius), _up(midpoint + radius))
+        return cls((midpoint - radius), (midpoint + radius))
 
     @property
     def dtype(self) -> jnp.dtype:

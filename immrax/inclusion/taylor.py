@@ -20,8 +20,7 @@ used when forming a global interval.
 
 Multiplication keeps terms through degree two and encloses the discarded
 cubic and quartic terms in ``R``.  Smooth unary functions use a second-order
-expansion about ``c`` and an interval Lagrange remainder.  Arithmetic uses
-ordinary JAX floating point and has not received a directed-rounding audit.
+expansion about ``c`` and an interval Lagrange remainder.
 
 Current deliberate limitations include a fixed normalized box, dense ``Q``,
 termwise polynomial ranges, interval-only fallbacks at singular-but-defined

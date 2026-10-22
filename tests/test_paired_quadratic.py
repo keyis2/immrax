@@ -45,6 +45,7 @@ from immrax.inclusion.quadratic_polynomial import (
     quadratic_range,
     quadratic_square,
     quadratic_sum_products,
+    reduce_cubic_monomials,
 )
 
 jax.config.update("jax_enable_x64", True)
@@ -332,6 +333,21 @@ def test_reduced_product_contains_samples_with_broadcast_jit_and_vmap(m, policy)
     for p in product(zero, y):
         for leaf in jax.tree.leaves(p):
             np.testing.assert_array_equal(leaf, jnp.zeros_like(leaf))
+
+
+def test_cubic_monomial_reduction_contract_jit_vmap_and_empty_sources():
+    # All-equal, either repeated-index pattern, and all-distinct monomials.
+    i, j, k = jnp.asarray([[0, 0, 0, 0], [0, 0, 1, 1], [0, 1, 1, 2]])
+    coefficients = jnp.asarray([4., -6., 8., -2.])
+    reduce = lambda c: reduce_cubic_monomials(i, j, k, c, 3)
+    linear, radius = jax.jit(jax.vmap(reduce))(jnp.stack((coefficients, -2 * coefficients)))
+    np.testing.assert_array_equal(linear, [[7., -3., 0.], [-14., 6., 0.]])
+    np.testing.assert_array_equal(radius, [10., 20.])
+    empty = jnp.asarray([], dtype=int)
+    linear, radius = jax.jit(lambda c: reduce_cubic_monomials(empty, empty, empty, c, 0))(
+        jnp.zeros((2, 0)))
+    assert linear.shape == (2, 0)
+    np.testing.assert_array_equal(radius, [0., 0.])
 
 
 def test_chebyshev_product_exact_toy_and_multiplicity_identities():

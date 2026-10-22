@@ -280,10 +280,23 @@ def _canonical_indices(m, degree):
                  (zip(*rows) if rows else [()] * degree))
 
 
+def cubic_monomial_indices(source_size):
+    """Static canonical ``i <= j <= k`` indices for :func:`reduce_cubic_monomials`.
+
+    All degree-three monomials occur once, in lexicographic order. For zero
+    sources, return three empty integer arrays. Callers form and collect their
+    own coefficients in this order before applying the shared reduction.
+    """
+    m = operator.index(source_size)
+    if m < 0:
+        raise ValueError("source size must be nonnegative")
+    return _canonical_indices(m, 3)
+
+
 def _cubic_product_coefficients(x: QuadraticPolynomial, y: QuadraticPolynomial):
     """Canonical cubic monomials, with signed like terms collected first."""
     # Source indices depend only on static shape; numerical work stays in JAX.
-    i, j, k = _canonical_indices(x.source_size, 3)
+    i, j, k = cubic_monomial_indices(x.source_size)
     sx = 0.5 * (x.quadratic + jnp.swapaxes(x.quadratic, -1, -2))
     sy = 0.5 * (y.quadratic + jnp.swapaxes(y.quadratic, -1, -2))
 
@@ -306,24 +319,37 @@ def _collected_cubic_radius(x: QuadraticPolynomial, y: QuadraticPolynomial):
 
 
 def _chebyshev_cubic(x: QuadraticPolynomial, y: QuadraticPolynomial):
-    """Chebyshev cubic reduction of one product; see :func:`_reduce_cubic`."""
+    """Chebyshev cubic reduction of one product."""
     if x.source_size == 0:
         return jnp.zeros_like(x.linear), jnp.zeros_like(x.constant)
-    return _reduce_cubic(*_cubic_product_coefficients(x, y), x.source_size)
+    return reduce_cubic_monomials(*_cubic_product_coefficients(x, y), x.source_size)
 
 
-def _reduce_cubic(i, j, k, coefficients, m):
-    """Retain .75*t from t^3 and .5*s from t^2*s, t != s.
+def reduce_cubic_monomials(i, j, k, coefficients, source_size):
+    """Return a Chebyshev linear shift and cubic residual radius on [-1,1]^m.
 
-    The residuals are .25*T3(t), .5*T2(t)*s, or an all-distinct monomial.
-    Since every factor is bounded by one, multiplicity weights .25/.5/1
-    give a continuous absolute-coefficient radius on the entire unit box.
+    ``coefficients[..., r]`` multiplies ``z[i[r]] z[j[r]] z[k[r]]`` directly,
+    with no factorial or half-weighting. The one-dimensional integer index
+    arrays must describe distinct canonical monomials ``0 <= i <= j <= k < m``;
+    omitted monomials have zero coefficient. Collect all signed contributions
+    to each monomial across the entire operation before calling this kernel.
+    ``source_size`` is the static nonnegative source dimension ``m``.
+
+    The returned arrays have shapes ``coefficients.shape[:-1] + (m,)`` and
+    ``coefficients.shape[:-1]``. They retain .75*t from t^3 and .5*s from
+    t^2*s, t != s. Leading value axes, jit, vmap, and m=0 are supported.
+
+    The residuals are .25*T3(t), .5*T2(t)*s, or an all-distinct monomial,
+    where Tn is the nth Chebyshev polynomial. Since every factor is bounded
+    by one, multiplicity weights .25/.5/1 give an absolute-coefficient radius
+    enclosing the cubic minus the returned linear form on the entire unit box.
     """
     same = i == k
     repeated = (i == j) | (j == k)
     target = jnp.where(i == j, k, i)
     retained = jnp.where(same, .75, jnp.where(repeated, .5, 0.)) * coefficients
-    linear = jnp.zeros(coefficients.shape[:-1] + (m,), coefficients.dtype).at[..., target].add(retained)
+    linear = jnp.zeros(coefficients.shape[:-1] + (source_size,), coefficients.dtype)
+    linear = linear.at[..., target].add(retained)
     radius = jnp.sum(jnp.abs(coefficients) * jnp.where(same, .25, jnp.where(repeated, .5, 1.)), axis=-1)
     return linear, radius
 
@@ -499,7 +525,7 @@ def quadratic_sum_products(x: QuadraticPolynomial, y: QuadraticPolynomial, *, ax
         separate_radius = jnp.sum(jnp.abs(cubic), axis=-1)
         cubic = total(cubic)
     if reduction is not None:
-        linear, cubic_radius = _reduce_cubic(*cubic_index, cubic, m)
+        linear, cubic_radius = reduce_cubic_monomials(*cubic_index, cubic, m)
         a = a + linear
         if reduction == "chebyshev4":
             *quartic_index, quartic = _quartic_product_coefficients(x, y)

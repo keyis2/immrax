@@ -86,7 +86,12 @@ from .paired_quadratic_transform import (
     pair_primitive_rules,
     pqif,
 )
-from .quadratic_polynomial import QuadraticPolynomial, quadratic_range
+from .quadratic_polynomial import (
+    QuadraticPolynomial,
+    cubic_monomial_indices,
+    quadratic_range,
+    reduce_cubic_monomials,
+)
 from .taylor import (
     QuadraticEndpointPair,
     TaylorModel,

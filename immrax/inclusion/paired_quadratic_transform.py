@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from functools import wraps
+from math import prod
 from typing import Any
 
 import equinox as eqx
@@ -38,6 +39,7 @@ from .paired_quadratic import (
     pair_min,
     pair_select_n,
     pair_sqrt,
+    pair_sum_products,
     pair_trig,
 )
 from .quadratic_polynomial import QuadraticPolynomial, quadratic_range
@@ -190,7 +192,7 @@ def _binary_mask_pair(mask: Interval, like: PairedQuadratic) -> PairedQuadratic:
 
 
 def _dot_general(a, b, *, dimension_numbers, **_):
-    """Broadcast elementwise products, then sum over the contracting axes."""
+    """Fuse uncertain products across all contracting axes before reduction."""
     like = _template((a, b))
     a, b = (_binary_mask_pair(v, like) if isinstance(v, Interval) else v for v in (a, b))
     a, b = _operand(a), _operand(b)
@@ -199,6 +201,13 @@ def _dot_general(a, b, *, dimension_numbers, **_):
     b = _to_front(b, tuple(b_batch) + tuple(b_contract))
     batch, lead = len(a_batch), len(a_batch) + len(a_contract)
     a_free, b_free = a.shape[lead:], b.shape[lead:]
+    if a_contract and isinstance(a, PairedQuadratic) and isinstance(b, PairedQuadratic):
+        # Flatten the contraction block, keeping batch and each free axis in
+        # dot_general output order. Singleton free axes provide broadcasting.
+        contraction = (prod(a.shape[batch:lead]),)
+        a = a.reshape(a.shape[:batch] + contraction + a_free + (1,) * len(b_free))
+        b = b.reshape(b.shape[:batch] + contraction + (1,) * len(a_free) + b_free)
+        return pair_sum_products(a, b, axis=batch)
     a = a.reshape(a.shape + (1,) * len(b_free))
     b = b.reshape(b.shape[:lead] + (1,) * len(a_free) + b_free)
     products = _mul(a, b)

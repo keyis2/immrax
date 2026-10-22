@@ -25,6 +25,7 @@ from .quadratic_polynomial import (
     quadratic_product,
     quadratic_range,
     quadratic_square,
+    quadratic_sum_products,
 )
 
 
@@ -246,7 +247,8 @@ def _magnitude(x: QuadraticPolynomial):
     return jnp.maximum(jnp.abs(bounds.lower), jnp.abs(bounds.upper))
 
 
-def pair_multiply(x: PairedQuadratic, y: PairedQuadratic) -> PairedQuadratic:
+def pair_multiply(x: PairedQuadratic, y: PairedQuadratic, *, collect_cubic=False,
+                  reduction="auto") -> PairedQuadratic:
     """Native midpoint/half-width product of two ordered pairs.
 
     With M = (L+U)/2 and D = (U-L)/2 >= 0 pointwise, every concrete product is
@@ -254,14 +256,51 @@ def pair_multiply(x: PairedQuadratic, y: PairedQuadratic) -> PairedQuadratic:
     within Mx My -/+ (mu_x Dy + mu_y Dx + Dx Dy), mu = max |range(M)|. The two
     degree-2 products are enclosed by ``quadratic_product``; only the upper
     enclosure of Dx Dy >= 0 is used, so the width is pointwise nonnegative.
+    Static ``collect_cubic=True`` opts both products into signed cubic
+    collection; the inherited half-width terms remain present. Operator ``*``
+    uses Chebyshev3 by default; explicit ``reduction=None`` retains the legacy
+    O(m^2) policy. ``"auto"`` respects explicit ``collect_cubic=True``.
+    Alternatively ``reduction='chebyshev3'`` or ``'chebyshev4'`` shifts both
+    retained products with analytic Chebyshev remainders. Width propagation
+    is unchanged, and the upper width-product enclosure remains valid.
     """
 
     mx, dx = 0.5 * (x.lower + x.upper), 0.5 * (x.upper - x.lower)
     my, dy = 0.5 * (y.lower + y.upper), 0.5 * (y.upper - y.lower)
-    center_lower, center_upper = quadratic_product(mx, my)
-    _, width_upper = quadratic_product(dx, dy)
+    center_lower, center_upper = quadratic_product(mx, my, collect_cubic=collect_cubic, reduction=reduction)
+    _, width_upper = quadratic_product(dx, dy, collect_cubic=collect_cubic, reduction=reduction)
     width = _magnitude(mx) * dy + _magnitude(my) * dx + width_upper
     return _finish(center_lower - width, center_upper + width, _input_valid(x, y))
+
+
+def pair_sum_products(x: PairedQuadratic, y: PairedQuadratic, *, axis=0, collect_cubic=False,
+                      reduction="auto") -> PairedQuadratic:
+    """Fused enclosure of sum_axis x*y for ordered pairs on shared sources.
+
+    Per term the midpoint/half-width bound of :func:`pair_multiply` holds, so
+    the sum lies within sum Mx My -/+ sum(mu_x Dy + mu_y Dx + Dx Dy). Both
+    sums use :func:`quadratic_sum_products`: signed like monomials of the
+    exact midpoint products cancel across ``axis`` before any reduction, and
+    the upper enclosure of sum Dx Dy >= 0 keeps every inherited width. Only
+    polynomial terms cancel; endpoint widths never do. ``axis`` indexes the
+    broadcast value shape. A term failing its premises poisons its sum.
+    The default is fused Chebyshev3; ``reduction=None`` keeps legacy bounds,
+    and ``collect_cubic=True`` with ``"auto"`` selects signed collection.
+    """
+
+    mx, dx = 0.5 * (x.lower + x.upper), 0.5 * (x.upper - x.lower)
+    my, dy = 0.5 * (y.lower + y.upper), 0.5 * (y.upper - y.lower)
+    options = dict(axis=axis, collect_cubic=collect_cubic, reduction=reduction)
+    center_lower, center_upper = quadratic_sum_products(mx, my, **options)
+    _, width_upper = quadratic_sum_products(dx, dy, **options)
+    shape = jnp.broadcast_shapes(x.shape, y.shape)
+    axis = axis % len(shape)
+    inherited = _magnitude(mx) * dy + _magnitude(my) * dx
+    # Both terms already have the broadcast shape; value axes precede sources.
+    inherited = QuadraticPolynomial(*(jnp.sum(v, axis=axis) for v in
+                                      (inherited.constant, inherited.linear, inherited.quadratic)))
+    valid = jnp.all(jnp.broadcast_to(_input_valid(x, y), shape), axis=axis)
+    return _finish(center_lower - (inherited + width_upper), center_upper + (inherited + width_upper), valid)
 
 
 def _choose(index, choices):

@@ -25,6 +25,7 @@ from immrax.inclusion.paired_quadratic import (
     pair_min,
     pair_multiply,
     pair_range,
+    pair_sum_products,
     pair_reciprocal,
     pair_sqrt,
     pair_square,
@@ -40,7 +41,10 @@ from immrax.inclusion.quadratic_polynomial import (
     constant_quadratic,
     evaluate_quadratic,
     normalized_quadratic_seed,
+    quadratic_product,
     quadratic_range,
+    quadratic_square,
+    quadratic_sum_products,
 )
 
 jax.config.update("jax_enable_x64", True)
@@ -271,6 +275,267 @@ def test_affine_singleton_product_and_point_division_are_exact():
     _assert_same(x / -4.0, x * jnp.reciprocal(-4.0))
 
 
+def test_product_collects_canceling_cubic_and_keeps_uncertain_widths():
+    a = QuadraticPolynomial(1.0, jnp.array([1.0]), jnp.array([[2.0]]))
+    b = QuadraticPolynomial(1.0, jnp.array([-1.0]), jnp.array([[2.0]]))
+    old = quadratic_product(a, b, reduction=None)
+    np.testing.assert_array_equal([p.constant for p in old], [-1.0, 4.0])
+    lower, upper = quadratic_product(a, b, collect_cubic=True)
+    np.testing.assert_array_equal([lower.constant, upper.constant], [1.0, 2.0])
+    np.testing.assert_array_equal(lower.linear, [0.0])
+    np.testing.assert_array_equal(lower.quadratic, [[2.0]])
+    _assert_same(lower.linear, upper.linear)
+    _assert_same(lower.quadratic, upper.quadratic)
+    # Widths include linear and positive quadratic dependence, not only constants.
+    width = QuadraticPolynomial(0.2, jnp.array([0.05]), jnp.array([[0.2]]))
+    x, y = PairedQuadratic(a - width, a + width), PairedQuadratic(b - 2 * width, b + 2 * width)
+    result = pair_multiply(x, y, collect_cubic=True)
+    compiled = jax.jit(lambda x, y: pair_multiply(x, y, collect_cubic=True))(x, y)
+    for a, b in zip(jax.tree.leaves(result), jax.tree.leaves(compiled)):
+        np.testing.assert_allclose(a, b, rtol=1e-13, atol=1e-13)
+    assert _margin(result, lambda x, y: x * y, x, y, points=19) >= -1e-12
+    assert float(result.upper.constant - result.lower.constant) > 1.0
+
+    # Equal mixed monomials also cancel when their factors use different indices.
+    a = QuadraticPolynomial(0., jnp.array([1., 0.]), jnp.array([[0., 2.], [0., 0.]]))
+    b = QuadraticPolynomial(0., jnp.array([0., 1.]), jnp.array([[0., 0.], [0., -2.]]))
+    lower, upper = quadratic_product(a, b, collect_cubic=True)
+    np.testing.assert_array_equal([lower.constant, upper.constant], [-1., 1.])
+    # The old component bound can beat termwise cubic collection: retain it.
+    a = QuadraticPolynomial(0., jnp.ones(2), jnp.zeros((2, 2)))
+    b = QuadraticPolynomial(0., jnp.zeros(2), jnp.diag(jnp.array([2., -2.])))
+    lower, upper = quadratic_product(a, b, collect_cubic=True)
+    np.testing.assert_array_equal([lower.constant, upper.constant], [-2., 2.])
+
+
+@pytest.mark.parametrize("policy", ["collected", "chebyshev3", "chebyshev4"])
+@pytest.mark.parametrize("m", [0, 1, 2, 4])
+def test_reduced_product_contains_samples_with_broadcast_jit_and_vmap(m, policy):
+    x, y = _polynomial((2, 1), m, 181), _polynomial((3,), m, 182)
+    options = {"collect_cubic": True} if policy == "collected" else {"reduction": policy}
+    product = lambda x, y: quadratic_product(x, y, **options)
+    eager = product(x, y)
+    compiled = jax.jit(product)(x, y)
+    mapped = jax.jit(jax.vmap(product, in_axes=(0, None)))(x, y)
+    for expected in (compiled, mapped):
+        for a, b in zip(jax.tree.leaves(eager), jax.tree.leaves(expected)):
+            np.testing.assert_allclose(a, b, rtol=1e-13, atol=1e-13)
+    sources = np.random.default_rng(183).uniform(-1, 1, size=(71, m))
+    if m:
+        sources[0], sources[1] = -1, 1
+    value = jax.vmap(lambda z: evaluate_quadratic(x, z) * evaluate_quadratic(y, z))(sources)
+    lower, upper = (jax.vmap(lambda z: evaluate_quadratic(p, z))(sources) for p in eager)
+    assert bool(jnp.all(value >= lower - 1e-12))
+    assert bool(jnp.all(value <= upper + 1e-12))
+    # Zero polynomials stay exact even when the other operand has dense coefficients.
+    zero = constant_quadratic(jnp.zeros((2, 1)), m)
+    for p in product(zero, y):
+        for leaf in jax.tree.leaves(p):
+            np.testing.assert_array_equal(leaf, jnp.zeros_like(leaf))
+
+
+def test_chebyshev_product_exact_toy_and_multiplicity_identities():
+    a = QuadraticPolynomial(1., jnp.array([1.]), jnp.array([[2.]]))
+    b = QuadraticPolynomial(1., jnp.array([-1.]), jnp.array([[2.]]))
+    for policy, constants, q in (("chebyshev3", [1., 2.], 2.),
+                                  ("chebyshev4", [.75, 1.], 4.)):
+        lower, upper = quadratic_product(a, b, reduction=policy)
+        np.testing.assert_array_equal([lower.constant, upper.constant], constants)
+        np.testing.assert_array_equal(lower.linear, [0.])
+        np.testing.assert_array_equal(lower.quadratic, [[q]])
+        # Full Chebyshev midpoint: 7/8+2*x^2, residual T4(x)/8.
+        if policy == "chebyshev4":
+            z = jnp.linspace(-1., 1., 37)
+            residual = (1 + z**2 + z**4) - (.875 + 2 * z**2)
+            np.testing.assert_allclose(residual, (8 * z**4 - 8 * z**2 + 1) / 8, atol=1e-15)
+
+    def monomial_q(i, j):
+        q = np.zeros((4, 4))
+        q[i, j] = 2.  # Deliberately nonsymmetric for distinct indices.
+        return QuadraticPolynomial(0., jnp.zeros(4), jnp.asarray(q))
+
+    # Cases list the exact retained c, linear vector, and half-weighted Q.
+    for indices, linear, radius in (((0, 0, 0), [.75, 0, 0, 0], .25),
+                                     ((0, 0, 1), [0, .5, 0, 0], .5),
+                                     ((0, 1, 2), [0, 0, 0, 0], 1.)):
+        i, j, k = indices
+        x = QuadraticPolynomial(0., jnp.eye(4)[i], jnp.zeros((4, 4)))
+        lower, upper = quadratic_product(x, monomial_q(j, k), reduction="chebyshev3")
+        np.testing.assert_allclose([lower.constant, upper.constant], [-radius, radius])
+        np.testing.assert_allclose(lower.linear, linear)
+    for indices, constant, updates, radius in (
+        ((0, 0, 0, 0), -.125, [(0, 0, 2.)], .125),
+        ((0, 0, 0, 1), 0., [(0, 1, .75), (1, 0, .75)], .25),
+        ((0, 0, 1, 1), -.25, [(0, 0, 1.), (1, 1, 1.)], .25),
+        ((0, 0, 1, 2), 0., [(1, 2, .5), (2, 1, .5)], .5),
+        ((0, 1, 2, 3), 0., [], 1.),
+    ):
+        i, j, k, l = indices
+        q = np.zeros((4, 4))
+        for row, col, value in updates:
+            q[row, col] = value
+        lower, upper = quadratic_product(monomial_q(i, j), monomial_q(k, l), reduction="chebyshev4")
+        np.testing.assert_allclose([lower.constant, upper.constant], [constant - radius, constant + radius])
+        np.testing.assert_allclose(lower.quadratic, q)
+    with pytest.raises(ValueError, match="choose"):
+        quadratic_product(a, b, collect_cubic=True, reduction="chebyshev4")
+
+
+def test_chebyshev4_midpoint_matches_independent_orthogonal_projection():
+    """Gauss-Chebyshev quadrature independently checks all retained coefficients.
+
+    Five nodes per axis integrate the product times every degree-two basis
+    function exactly; this also exercises mixed signs and all index patterns.
+    """
+    x, y = _polynomial((2, 1), 3, 191), _polynomial((3,), 3, 192)
+    nodes = np.cos((np.arange(5) + .5) * np.pi / 5)
+    z = np.asarray(list(itertools.product(nodes, repeat=3)))
+    values = np.asarray(jax.vmap(lambda s: evaluate_quadratic(x, s) * evaluate_quadratic(y, s))(z))
+    t2 = 2 * z**2 - 1
+    cheb_diagonal = 2 * np.einsum("s...,si->...i", values, t2) / len(z)
+    expected_c = values.mean(axis=0) - cheb_diagonal.sum(axis=-1)
+    expected_l = 2 * np.einsum("s...,si->...i", values, z) / len(z)
+    expected_q = 4 * np.einsum("s...,si,sj->...ij", values, z, z) / len(z)
+    for i in range(3):
+        expected_q[..., i, i] = 4 * cheb_diagonal[..., i]
+    lo, hi = quadratic_product(x, y, reduction="chebyshev4")
+    midpoint = .5 * (lo + hi)
+    np.testing.assert_allclose(midpoint.constant, expected_c, atol=2e-13, rtol=2e-13)
+    np.testing.assert_allclose(midpoint.linear, expected_l, atol=2e-13, rtol=2e-13)
+    q = np.asarray(midpoint.quadratic)
+    np.testing.assert_allclose(.5 * (q + q.swapaxes(-1, -2)), expected_q, atol=2e-13, rtol=2e-13)
+
+
+_SUM_POLICIES = {"legacy": {"reduction": None}, "collected": {"collect_cubic": True},
+                 "chebyshev3": {"reduction": "chebyshev3"}, "chebyshev4": {"reduction": "chebyshev4"}}
+
+
+def test_fused_sum_products_cancels_cross_product_cubics():
+    # (1+x)x^2 + (1-x)x^2 = 2x^2: only signed cubic collection across terms is exact.
+    a = QuadraticPolynomial(jnp.ones(2), jnp.array([[1.], [-1.]]), jnp.zeros((2, 1, 1)))
+    b = QuadraticPolynomial(jnp.zeros(2), jnp.zeros((2, 1)), jnp.full((2, 1, 1), 2.))
+    for policy, options in _SUM_POLICIES.items():
+        separate = [quadratic_product(a[i], b[i], **options) for i in range(2)]
+        separate = [separate[0][side] + separate[1][side] for side in (0, 1)]
+        separate_radius = {"legacy": 2., "collected": 2., "chebyshev3": .5, "chebyshev4": .5}[policy]
+        np.testing.assert_array_equal([separate[0].constant, separate[1].constant],
+                                      [-separate_radius, separate_radius])
+        fused = quadratic_sum_products(a, b, **options)
+        paired = pair_sum_products(PairedQuadratic(a, a), PairedQuadratic(b, b), **options)
+        for lower, upper in (fused, (paired.lower, paired.upper)):
+            radius = 2. if policy == "legacy" else 0.
+            np.testing.assert_array_equal([lower.constant, upper.constant], [-radius, radius])
+            np.testing.assert_array_equal(lower.linear, [0.])
+            np.testing.assert_array_equal(lower.quadratic, [[4.]])
+    # Single-term axis reproduces the completed single-product regression.
+    x = QuadraticPolynomial(1., jnp.array([1.]), jnp.array([[2.]]))
+    y = QuadraticPolynomial(1., jnp.array([-1.]), jnp.array([[2.]]))
+    for options in _SUM_POLICIES.values():
+        for single, summed in zip(quadratic_product(x, y, **options),
+                                  quadratic_sum_products(x[None], y[None], **options)):
+            for left, right in zip(jax.tree.leaves(single), jax.tree.leaves(summed)):
+                np.testing.assert_allclose(left, right, rtol=0, atol=1e-15)
+
+
+def test_chebyshev3_defaults_multiply_and_fuse_sum_and_dot():
+    # Separate cubic residuals are +/-1/4, whereas their fused sum is exact.
+    a = QuadraticPolynomial(jnp.ones(2), jnp.array([[1.], [-1.]]), jnp.zeros((2, 1, 1)))
+    b = QuadraticPolynomial(jnp.zeros(2), jnp.zeros((2, 1)), jnp.full((2, 1, 1), 2.))
+    x, y = PairedQuadratic(a, a), PairedQuadratic(b, b)
+    _assert_same(x * y, pair_multiply(x, y, reduction="chebyshev3"))
+    _assert_same(quadratic_product(a, b), quadratic_product(a, b, reduction="chebyshev3"))
+    np.testing.assert_array_equal((x * y).lower.constant, [-.25, -.25])
+    for fused in (pair_sum_products(x, y), pqif(jnp.dot)(x, y),
+                  jax.jit(pqif(jnp.dot))(x, y)):
+        for endpoint in (fused.lower, fused.upper):
+            np.testing.assert_array_equal(endpoint.constant, 0.)
+            np.testing.assert_array_equal(endpoint.linear, [0.])
+            np.testing.assert_array_equal(endpoint.quadratic, [[4.]])
+    _assert_same(quadratic_sum_products(a, b), quadratic_sum_products(a, b, reduction="chebyshev3"))
+    np.testing.assert_array_equal(pair_sum_products(x, y, reduction=None).lower.constant, -2.)
+    _assert_same(quadratic_product(a, b, collect_cubic=True),
+                 quadratic_product(a, b, collect_cubic=True, reduction=None))
+    with pytest.raises(ValueError, match="choose collect_cubic"):
+        pair_sum_products(x, y, collect_cubic=True, reduction="chebyshev3")
+
+    # A globally positive quadratic exercises pair_square's fixed-sign path.
+    # Its cubic 2*x^3 retains 1.5*x with residual radius .5; x^4 stays [0,1].
+    q = QuadraticPolynomial(2., jnp.array([1.]), jnp.array([[2.]]))
+    lower, upper = quadratic_square(q)
+    np.testing.assert_array_equal([lower.constant, upper.constant], [3.5, 5.5])
+    np.testing.assert_array_equal(lower.linear, [5.5])
+    np.testing.assert_array_equal(lower.quadratic, [[10.]])
+    _assert_same(pair_square(PairedQuadratic(q, q)), PairedQuadratic(lower, upper))
+    _assert_same(pair_integer_pow(PairedQuadratic(q, q), 2), PairedQuadratic(lower, upper))
+    legacy = quadratic_square(q, reduction=None)
+    np.testing.assert_array_equal([p.constant for p in legacy], [2., 7.])
+
+
+def test_fused_dot_general_batch_multiple_empty_and_no_contraction_axes():
+    # Permuted batch axes and two contraction axes leave two independent free
+    # axes; each uncertain operand broadcasts across the other's free axis.
+    a = constant_pair(jnp.arange(24., dtype=jnp.float64).reshape(2, 2, 2, 3), 1)
+    b = constant_pair(jnp.arange(48., dtype=jnp.float64).reshape(3, 2, 2, 4), 1)
+    dimensions = (((3, 2), (0, 1)), ((1,), (2,)))
+    function = lambda a, b: lax.dot_general(a, b, dimensions)
+    actual = pqif(function)(a, b)
+    expected = function(a.lower.constant, b.lower.constant)
+    np.testing.assert_array_equal(actual.lower.constant, expected)
+    _assert_same(actual.lower, actual.upper)
+    bad = PairedQuadratic(a.lower, a.upper, a.valid.at[0, 1, 0, 0].set(False))
+    valid = pqif(function)(bad, b).valid
+    np.testing.assert_array_equal(valid, np.broadcast_to([[[True], [True]], [[False], [True]]], (2, 2, 4)))
+    # Empty contraction has the additive identity and no contributing invalid
+    # entries; no contraction axes instead gives an uncertain outer product.
+    empty_a, empty_b = constant_pair(jnp.zeros((2, 0)), 1), constant_pair(jnp.zeros((0, 3)), 1)
+    empty = pqif(jnp.matmul)(empty_a, empty_b)
+    np.testing.assert_array_equal(empty.lower.constant, jnp.zeros((2, 3)))
+    assert bool(jnp.all(empty.valid))
+    x, y = _pair((2,), 1, 216), _pair((3,), 1, 217)
+    outer = pqif(lambda a, b: lax.dot_general(a, b, (((), ()), ((), ()))))(x, y)
+    _assert_same(outer, pair_multiply(x.reshape(2, 1), y.reshape(1, 3)))
+
+
+@pytest.mark.parametrize("policy", list(_SUM_POLICIES))
+@pytest.mark.parametrize("m", [0, 1, 3])
+def test_fused_pair_sum_contains_samples_never_loosens_and_traces(m, policy):
+    """Mixed-sign products with inherited widths, broadcasting, JIT and outer vmap."""
+    options = _SUM_POLICIES[policy]
+    x, y = _pair((4, 1), m, 211), _pair((4, 3), m, 212)
+    fused = pair_sum_products(x, y, axis=-2, **options)
+    assert fused.shape == (3,) and bool(jnp.all(fused.valid))
+    separate = pair_multiply(x, y, **options)
+    separate = sum((separate[i] for i in range(1, 4)), separate[0])
+    # Identical retained polynomials; fused cubic/quartic bounds are never wider.
+    for side, sign in (("lower", 1.), ("upper", -1.)):
+        difference = quadratic_range(sign * (getattr(fused, side) - getattr(separate, side)))
+        assert bool(jnp.all(difference.lower >= -1e-12))
+        np.testing.assert_allclose(difference.upper - difference.lower, 0., atol=1e-12)
+    rng = np.random.default_rng(213)
+    sources = rng.uniform(-1, 1, size=(97, m))
+    if m:
+        sources[0], sources[1] = -1, 1
+    tx, ty = rng.uniform(-1, 1, size=(2, 97, 4, 3))
+
+    def concrete(pair, t, z):
+        lower, upper = evaluate_pair(pair, z)
+        return .5 * (lower + upper) + t * .5 * (upper - lower)
+
+    for z, sx, sy in zip(sources, tx, ty):
+        value = jnp.sum(concrete(x, sx[:, :1], z) * concrete(y, sy, z), axis=0)
+        lower, upper = evaluate_pair(fused, z)
+        assert bool(jnp.all((value >= lower - 1e-11) & (value <= upper + 1e-11)))
+    function = lambda x, y: pair_sum_products(x, y, axis=0, **options)
+    batch = _pair((2, 4, 1), m, 214)
+    compiled = jax.jit(function)(x, y)
+    mapped = jax.jit(jax.vmap(function, in_axes=(0, None)))(batch, y)
+    for expected, actual in ((fused, compiled), (function(batch[1], y), mapped[1])):
+        for left, right in zip(jax.tree.leaves(expected), jax.tree.leaves(actual)):
+            np.testing.assert_allclose(left, right, rtol=1e-13, atol=1e-13)
+    with pytest.raises(ValueError, match="out of range"):
+        pair_sum_products(x, y, axis=2)
+
+
 # ---------------------------------------------------------------- nonlinear core
 
 def _signed_pair(sign, shape=(2, 3), seed=20):
@@ -299,6 +564,9 @@ def test_nonlinear_rules_contain_dense_samples():
     assert bool(jnp.any(pair_range(x).lower < 0) & jnp.any(pair_range(x).upper > 0))
     checks = (
         (x * y, lambda a, b: a * b, x, y),
+        (pair_multiply(x, y, collect_cubic=True), lambda a, b: a * b, x, y),
+        (pair_multiply(x, y, reduction="chebyshev3"), lambda a, b: a * b, x, y),
+        (pair_multiply(x, y, reduction="chebyshev4"), lambda a, b: a * b, x, y),
         (pair_square(x), lambda a: a * a, x),
         (pair_square(negative), lambda a: a * a, negative),
         (pair_reciprocal(positive), lambda a: 1 / a, positive),
@@ -363,6 +631,9 @@ def test_exact_singleton_and_point_factor_behavior():
 
 _OPERATIONS = {
     "mul": lambda a, b: pair_multiply(a, b),
+    "mul collected": lambda a, b: pair_multiply(a, b, collect_cubic=True),
+    "mul chebyshev3": lambda a, b: pair_multiply(a, b, reduction="chebyshev3"),
+    "mul chebyshev4": lambda a, b: pair_multiply(a, b, reduction="chebyshev4"),
     "square": lambda a, b: pair_square(a),
     "pow0": lambda a, b: pair_integer_pow(a, 0),
     "reciprocal": lambda a, b: pair_reciprocal(b),

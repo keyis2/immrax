@@ -9,11 +9,13 @@ Source identity is not tracked; operands must share one normalized seed.
 
 from __future__ import annotations
 
+import functools
 import itertools
 import operator
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.tree_util import register_pytree_node_class
 
 from .interval import Interval
@@ -273,18 +275,23 @@ def _with_constant_bounds(c, a, q, omitted: Interval):
             QuadraticPolynomial(c + omitted.upper, a, q))
 
 
+@functools.lru_cache(maxsize=None)
 def _canonical_indices(m, degree):
-    # Static nondecreasing index tuples; empty arrays when there are no sources.
+    # Static nondecreasing NumPy index tuples (empty without sources). Masks
+    # and weights derived from them stay host constants, not traced equations.
     rows = list(itertools.combinations_with_replacement(range(m), degree))
-    return tuple(jnp.asarray(v, dtype=int) for v in
-                 (zip(*rows) if rows else [()] * degree))
+    indices = tuple(np.asarray(v, dtype=int) for v in (zip(*rows) if rows else [()] * degree))
+    for v in indices:
+        v.flags.writeable = False  # shared by the cache
+    return indices
 
 
 def cubic_monomial_indices(source_size):
     """Static canonical ``i <= j <= k`` indices for :func:`reduce_cubic_monomials`.
 
     All degree-three monomials occur once, in lexicographic order. For zero
-    sources, return three empty integer arrays. Callers form and collect their
+    sources, return three empty integer arrays. They are static NumPy arrays,
+    so index masks stay out of traced graphs. Callers form and collect their
     own coefficients in this order before applying the shared reduction.
     """
     m = operator.index(source_size)
@@ -301,7 +308,7 @@ def _cubic_product_coefficients(x: QuadraticPolynomial, y: QuadraticPolynomial):
     sy = 0.5 * (y.quadratic + jnp.swapaxes(y.quadratic, -1, -2))
 
     def term(a, b, c):
-        weight = jnp.where(b == c, 0.5, 1.0)
+        weight = np.where(b == c, 0.5, 1.0).astype(sx.dtype)  # static, exact; keeps the operand dtype
         return weight * (
             x.linear[..., a] * sy[..., b, c] + y.linear[..., a] * sx[..., b, c])
 
@@ -335,8 +342,9 @@ def reduce_cubic_monomials(i, j, k, coefficients, source_size):
     to each monomial across the entire operation before calling this kernel.
     ``source_size`` is the static nonnegative source dimension ``m``.
 
-    The returned arrays have shapes ``coefficients.shape[:-1] + (m,)`` and
-    ``coefficients.shape[:-1]``. They retain .75*t from t^3 and .5*s from
+    The index arrays must be concrete (not traced), as returned by
+    :func:`cubic_monomial_indices`. The returned arrays have shapes
+    ``coefficients.shape[:-1] + (m,)`` and ``coefficients.shape[:-1]``. They retain .75*t from t^3 and .5*s from
     t^2*s, t != s. Leading value axes, jit, vmap, and m=0 are supported.
 
     The residuals are .25*T3(t), .5*T2(t)*s, or an all-distinct monomial,
@@ -344,13 +352,14 @@ def reduce_cubic_monomials(i, j, k, coefficients, source_size):
     by one, multiplicity weights .25/.5/1 give an absolute-coefficient radius
     enclosing the cubic minus the returned linear form on the entire unit box.
     """
+    i, j, k = (np.asarray(v) for v in (i, j, k))
     same = i == k
     repeated = (i == j) | (j == k)
-    target = jnp.where(i == j, k, i)
-    retained = jnp.where(same, .75, jnp.where(repeated, .5, 0.)) * coefficients
+    target = np.where(i == j, k, i)
+    weights = lambda *w: np.where(same, w[0], np.where(repeated, w[1], w[2])).astype(coefficients.dtype)
     linear = jnp.zeros(coefficients.shape[:-1] + (source_size,), coefficients.dtype)
-    linear = linear.at[..., target].add(retained)
-    radius = jnp.sum(jnp.abs(coefficients) * jnp.where(same, .25, jnp.where(repeated, .5, 1.)), axis=-1)
+    linear = linear.at[..., target].add(weights(.75, .5, 0.) * coefficients)
+    radius = jnp.sum(jnp.abs(coefficients) * weights(.25, .5, 1.), axis=-1)
     return linear, radius
 
 
@@ -454,7 +463,6 @@ def quadratic_product(x: QuadraticPolynomial, y: QuadraticPolynomial, *, collect
     )
     lx, qx = _component_ranges(x)
     ly, qy = _component_ranges(y)
-    first, second, third = _imul(lx, qy), _imul(qx, ly), _imul(qx, qy)
     if reduction is not None:
         linear, cubic_radius = _chebyshev_cubic(x, y)
         a = a + linear
@@ -464,8 +472,11 @@ def quadratic_product(x: QuadraticPolynomial, y: QuadraticPolynomial, *, collect
             radius = cubic_radius + quartic_radius
             omitted = Interval(-radius, radius)
         else:
+            third = _imul(qx, qy)
             omitted = Interval(third.lower - cubic_radius, third.upper + cubic_radius)
-    elif collect_cubic:
+        return _with_constant_bounds(c, a, q, omitted)
+    first, second, third = _imul(lx, qy), _imul(qx, ly), _imul(qx, qy)
+    if collect_cubic:
         cubic_radius = _collected_cubic_radius(x, y)
         omitted = Interval(jnp.maximum(first.lower + second.lower, -cubic_radius) + third.lower,
                            jnp.minimum(first.upper + second.upper, cubic_radius) + third.upper)
@@ -518,14 +529,11 @@ def quadratic_sum_products(x: QuadraticPolynomial, y: QuadraticPolynomial, *, ax
                 + y.linear[..., :, None] * x.linear[..., None, :], axis=axis)
     lx, qx = _component_ranges(x)
     ly, qy = _component_ranges(y)
-    first, second, third = _imul(lx, qy), _imul(qx, ly), _imul(qx, qy)
     total = lambda value: jnp.sum(value, axis=axis)
     if reduction is not None or collect_cubic:
         *cubic_index, cubic = _cubic_product_coefficients(x, y)
-        separate_radius = jnp.sum(jnp.abs(cubic), axis=-1)
-        cubic = total(cubic)
     if reduction is not None:
-        linear, cubic_radius = reduce_cubic_monomials(*cubic_index, cubic, m)
+        linear, cubic_radius = reduce_cubic_monomials(*cubic_index, total(cubic), m)
         a = a + linear
         if reduction == "chebyshev4":
             *quartic_index, quartic = _quartic_product_coefficients(x, y)
@@ -534,10 +542,15 @@ def quadratic_sum_products(x: QuadraticPolynomial, y: QuadraticPolynomial, *, ax
             radius = cubic_radius + quartic_radius
             omitted = Interval(-radius, radius)
         else:
+            third = _imul(qx, qy)
             omitted = Interval(total(third.lower) - cubic_radius, total(third.upper) + cubic_radius)
-    elif collect_cubic:
+        return _with_constant_bounds(c, a, q, omitted)
+    first, second, third = _imul(lx, qy), _imul(qx, ly), _imul(qx, qy)
+    if collect_cubic:
         # Separate collected bounds, then the fused signed radius: all
         # enclose the same omitted cubic about the same retained centre.
+        separate_radius = jnp.sum(jnp.abs(cubic), axis=-1)
+        cubic = total(cubic)
         cubic_radius = jnp.sum(jnp.abs(cubic), axis=-1)
         separate = Interval(total(jnp.maximum(first.lower + second.lower, -separate_radius)),
                             total(jnp.minimum(first.upper + second.upper, separate_radius)))

@@ -19,6 +19,8 @@ from jax.tree_util import register_pytree_node_class
 from .interval import Interval
 from .quadratic_polynomial import (
     QuadraticPolynomial,
+    _broadcast,
+    _value_axis,
     constant_quadratic,
     evaluate_quadratic,
     normalized_quadratic_seed,
@@ -247,6 +249,23 @@ def _magnitude(x: QuadraticPolynomial):
     return jnp.maximum(jnp.abs(bounds.lower), jnp.abs(bounds.upper))
 
 
+def _center_width_operands(x: PairedQuadratic, y: PairedQuadratic):
+    """Stacked ``(M, D)`` midpoint/half-width operands on the broadcast shape.
+
+    One product of the stacked operands performs, elementwise, exactly the
+    arithmetic of the separate ``Mx My`` and ``Dx Dy`` products.
+    """
+    shape = jnp.broadcast_shapes(x.shape, y.shape)
+    stack = lambda a, b: jax.tree.map(lambda u, v: jnp.stack((u, v)), _broadcast(a, shape), _broadcast(b, shape))
+    mx, dx = 0.5 * (x.lower + x.upper), 0.5 * (x.upper - x.lower)
+    my, dy = 0.5 * (y.lower + y.upper), 0.5 * (y.upper - y.lower)
+    return shape, (mx, dx, my, dy), stack(mx, dx), stack(my, dy)
+
+
+def _row(x: QuadraticPolynomial, index) -> QuadraticPolynomial:
+    return jax.tree.map(lambda value: value[index], x)
+
+
 def pair_multiply(x: PairedQuadratic, y: PairedQuadratic, *, collect_cubic=False,
                   reduction="auto") -> PairedQuadratic:
     """Native midpoint/half-width product of two ordered pairs.
@@ -265,10 +284,9 @@ def pair_multiply(x: PairedQuadratic, y: PairedQuadratic, *, collect_cubic=False
     is unchanged, and the upper width-product enclosure remains valid.
     """
 
-    mx, dx = 0.5 * (x.lower + x.upper), 0.5 * (x.upper - x.lower)
-    my, dy = 0.5 * (y.lower + y.upper), 0.5 * (y.upper - y.lower)
-    center_lower, center_upper = quadratic_product(mx, my, collect_cubic=collect_cubic, reduction=reduction)
-    _, width_upper = quadratic_product(dx, dy, collect_cubic=collect_cubic, reduction=reduction)
+    _, (mx, dx, my, dy), stacked_x, stacked_y = _center_width_operands(x, y)
+    lower, upper = quadratic_product(stacked_x, stacked_y, collect_cubic=collect_cubic, reduction=reduction)
+    center_lower, center_upper, width_upper = _row(lower, 0), _row(upper, 0), _row(upper, 1)
     width = _magnitude(mx) * dy + _magnitude(my) * dx + width_upper
     return _finish(center_lower - width, center_upper + width, _input_valid(x, y))
 
@@ -288,13 +306,11 @@ def pair_sum_products(x: PairedQuadratic, y: PairedQuadratic, *, axis=0, collect
     and ``collect_cubic=True`` with ``"auto"`` selects signed collection.
     """
 
-    mx, dx = 0.5 * (x.lower + x.upper), 0.5 * (x.upper - x.lower)
-    my, dy = 0.5 * (y.lower + y.upper), 0.5 * (y.upper - y.lower)
-    options = dict(axis=axis, collect_cubic=collect_cubic, reduction=reduction)
-    center_lower, center_upper = quadratic_sum_products(mx, my, **options)
-    _, width_upper = quadratic_sum_products(dx, dy, **options)
-    shape = jnp.broadcast_shapes(x.shape, y.shape)
-    axis = axis % len(shape)
+    shape, (mx, dx, my, dy), stacked_x, stacked_y = _center_width_operands(x, y)
+    axis = _value_axis(axis, len(shape))
+    lower, upper = quadratic_sum_products(stacked_x, stacked_y, axis=axis + 1, collect_cubic=collect_cubic,
+                                          reduction=reduction)
+    center_lower, center_upper, width_upper = _row(lower, 0), _row(upper, 0), _row(upper, 1)
     inherited = _magnitude(mx) * dy + _magnitude(my) * dx
     # Both terms already have the broadcast shape; value axes precede sources.
     inherited = QuadraticPolynomial(*(jnp.sum(v, axis=axis) for v in

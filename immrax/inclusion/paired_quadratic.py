@@ -576,9 +576,13 @@ def pair_trig(kind: str, x: PairedQuadratic) -> PairedQuadratic:
     high_sector = jnp.floor((global_range.upper - critical_offset) / jnp.pi)
     monotone = low_sector == high_sector
     increasing = jnp.cos(midpoint) >= 0 if kind == "sin" else -jnp.sin(midpoint) >= 0
-    lower, _ = _curvature_unary(_where(increasing, x.lower, x.upper), kind)
-    _, upper = _curvature_unary(_where(increasing, x.upper, x.lower), kind)
-    singleton_lower, singleton_upper = _curvature_unary(x.lower, kind)
+    # The envelope is elementwise, so selecting endpoints after forming each
+    # endpoint's envelope once equals enveloping the selected endpoint.
+    lower_envelope = _curvature_unary(x.lower, kind)
+    upper_envelope = _curvature_unary(x.upper, kind)
+    lower = _where(increasing, lower_envelope[0], upper_envelope[0])
+    upper = _where(increasing, upper_envelope[1], lower_envelope[1])
+    singleton_lower, singleton_upper = lower_envelope
     singleton = _exact_singleton(x)
     minus_one = constant_quadratic(-jnp.ones_like(x.lower.constant), x.source_size)
     one = constant_quadratic(jnp.ones_like(x.upper.constant), x.source_size)

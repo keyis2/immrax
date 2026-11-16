@@ -567,7 +567,8 @@ def pair_trig(kind: str, x: PairedQuadratic) -> PairedQuadratic:
 
     On a monotone sector the increasing (decreasing) endpoint feeds each side.
     A range touching a critical point uses the signed-curvature envelope of
-    an exact singleton's one polynomial, and otherwise the constant [-1, 1].
+    an exact singleton's one polynomial. A nonsingleton instead uses the
+    exact trigonometric range of its global interval, including critical points.
     """
     global_range = pair_range(x)
     midpoint = 0.5 * global_range.lower + 0.5 * global_range.upper
@@ -584,10 +585,11 @@ def pair_trig(kind: str, x: PairedQuadratic) -> PairedQuadratic:
     upper = _where(increasing, upper_envelope[1], lower_envelope[1])
     singleton_lower, singleton_upper = lower_envelope
     singleton = _exact_singleton(x)
-    minus_one = constant_quadratic(-jnp.ones_like(x.lower.constant), x.source_size)
-    one = constant_quadratic(jnp.ones_like(x.upper.constant), x.source_size)
-    lower = _where(monotone, lower, _where(singleton, singleton_lower, minus_one))
-    upper = _where(monotone, upper, _where(singleton, singleton_upper, one))
+    hull_lower,hull_upper = _trig_range(kind,global_range.lower,global_range.upper)
+    hull_lower = constant_quadratic(hull_lower,x.source_size)
+    hull_upper = constant_quadratic(hull_upper,x.source_size)
+    lower = _where(monotone, lower, _where(singleton, singleton_lower, hull_lower))
+    upper = _where(monotone, upper, _where(singleton, singleton_upper, hull_upper))
     return _finish(lower, upper, _input_valid(x))
 
 

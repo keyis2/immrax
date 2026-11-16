@@ -896,7 +896,7 @@ def test_unary_and_nonsmooth_rules_contain_samples():
         assert bool(jnp.all(result.valid)), name
         assert _margin(result, function, *operands) >= -1e-12, name
     # max(pair, -inf) is the pair itself; a non-singleton range across a
-    # critical point keeps the constant trig hull [-1, 1].
+    # critical point uses its global trigonometric interval hull.
     x = 0.1 * _pair((2, 3), 3, 11)
     neutral = pair_max(x, jnp.full((2, 3), -jnp.inf))
     _assert_same((neutral.lower, neutral.upper), (x.lower, x.upper))
@@ -904,8 +904,8 @@ def test_unary_and_nonsmooth_rules_contain_samples():
     critical = ~((jnp.floor((pair_range(3.0 * _pair((2, 3), 3, 13)).lower - jnp.pi / 2) / jnp.pi))
                  == jnp.floor((pair_range(3.0 * _pair((2, 3), 3, 13)).upper - jnp.pi / 2) / jnp.pi))
     assert bool(jnp.any(critical))
-    np.testing.assert_array_equal(hull.lower.constant[critical], -1.0)
-    np.testing.assert_array_equal(hull.upper.constant[critical], 1.0)
+    assert bool(jnp.all(hull.lower.constant[critical]>=-1.0))
+    assert bool(jnp.all(hull.upper.constant[critical]<=1.0))
 
 
 def test_sqrt_rejects_negative_domain_per_element():
@@ -947,10 +947,25 @@ def test_trig_quadratic_input_signed_remainder_and_nonsingleton_domains():
             assert _margin(pair_trig(kind, value), function, value) >= -1e-14
     crossing = PairedQuadratic(p-.8, p+.8)
     hull = pair_trig("cos", crossing)
-    np.testing.assert_array_equal(hull.lower.constant, -1.)
+    np.testing.assert_allclose(hull.lower.constant, np.cos(1.85),atol=1e-15)
     np.testing.assert_array_equal(hull.upper.constant, 1.)
     np.testing.assert_array_equal(hull.lower.linear, 0.)
     np.testing.assert_array_equal(hull.upper.quadratic, 0.)
+
+
+def test_trig_nonsingleton_critical_fibre_keeps_tiny_and_periodic_ranges():
+    # A genuine interval fibre near yaw zero must not turn cos into [-1,1].
+    for kind,center,expected in (("cos",0.,1.),("cos",2*np.pi,1.),("cos",np.pi,-1.),("sin",np.pi/2,1.),("sin",-3*np.pi/2,1.)):
+        radius=2.5e-4
+        value=PairedQuadratic(constant_quadratic(jnp.array(center-radius),1),constant_quadratic(jnp.array(center+radius),1))
+        result=jax.jit(lambda x:pair_trig(kind,x))(value)
+        lo,hi=np.asarray(result.lower.constant),np.asarray(result.upper.constant)
+        np.testing.assert_allclose([lo,hi], [np.cos(radius),1.] if expected>0 else [-1.,-np.cos(radius)],rtol=0,atol=2e-15)
+        assert _margin(result,jnp.sin if kind=="sin" else jnp.cos,value)>=-1e-14
+    value=PairedQuadratic(constant_quadratic(jnp.array(-4.),1),constant_quadratic(jnp.array(4.),1))
+    for kind in ("sin","cos"):
+        result=pair_trig(kind,value)
+        np.testing.assert_array_equal([result.lower.constant,result.upper.constant],[-1.,1.])
 
 
 def test_trig_constant_invalid_and_jit_vmap_contract():
